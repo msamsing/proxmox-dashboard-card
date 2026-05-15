@@ -1,4 +1,4 @@
-const PROXMOX_DASHBOARD_CARD_VERSION = "0.1.0";
+const PROXMOX_DASHBOARD_CARD_VERSION = "0.1.1";
 const PROXMOX_DASHBOARD_CARD_TYPE = "proxmox-dashboard-card";
 
 const DEFAULT_THRESHOLDS = {
@@ -1303,7 +1303,7 @@ class ProxmoxDashboardCardEditor extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    this._bindPickers();
+    this._populateEntityOptions();
   }
 
   _render() {
@@ -1331,10 +1331,11 @@ class ProxmoxDashboardCardEditor extends HTMLElement {
           </div>
           ${(this._config.nodes || []).map((node, index) => this._nodeEditor(node, index)).join("")}
         </section>
+        <datalist id="pdc-entity-options"></datalist>
       </div>
     `;
     this._attachEvents();
-    this._bindPickers();
+    this._populateEntityOptions();
   }
 
   _nodeEditor(node, index) {
@@ -1480,7 +1481,16 @@ class ProxmoxDashboardCardEditor extends HTMLElement {
     return `
       <label class="field">
         <span>${html(label)}</span>
-        <ha-entity-picker data-path="${html(path)}" data-value="${html(value || "")}" allow-custom-entity></ha-entity-picker>
+        <input
+          class="entity-input"
+          type="text"
+          list="pdc-entity-options"
+          data-path="${html(path)}"
+          value="${html(value || "")}"
+          placeholder="sensor.example_entity"
+          autocomplete="off"
+          spellcheck="false"
+        >
       </label>
     `;
   }
@@ -1514,18 +1524,17 @@ class ProxmoxDashboardCardEditor extends HTMLElement {
     });
   }
 
-  _bindPickers() {
-    if (!this.shadowRoot) return;
-    this.shadowRoot.querySelectorAll("ha-entity-picker").forEach((picker) => {
-      picker.hass = this._hass;
-      picker.value = picker.dataset.value || "";
-      if (!picker.__pdcBound) {
-        picker.__pdcBound = true;
-        picker.addEventListener("value-changed", (event) => {
-          this._updatePath(picker.dataset.path, event.detail?.value || "");
-        });
-      }
-    });
+  _populateEntityOptions() {
+    if (!this.shadowRoot || !this._hass?.states) return;
+    const datalist = this.shadowRoot.querySelector("#pdc-entity-options");
+    if (!datalist) return;
+
+    const entityIds = Object.keys(this._hass.states).sort((a, b) => a.localeCompare(b));
+    const signature = entityIds.join("|");
+    if (datalist.dataset.signature === signature) return;
+
+    datalist.dataset.signature = signature;
+    datalist.innerHTML = entityIds.map((entityId) => `<option value="${html(entityId)}"></option>`).join("");
   }
 
   _handleAction(button) {
@@ -1731,7 +1740,7 @@ class ProxmoxDashboardCardEditor extends HTMLElement {
 
       input,
       select,
-      ha-entity-picker {
+      .entity-input {
         width: 100%;
       }
 
