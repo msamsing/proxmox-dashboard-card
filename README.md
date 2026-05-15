@@ -11,6 +11,7 @@ A Home Assistant Lovelace custom card for monitoring a Proxmox cluster at a glan
 - Physical disk status with health, temperature, and wearout indicators.
 - Storage pool usage bars.
 - VM and LXC rows with status dots and compact load bars.
+- Collapsible details view, so the card can run as a compact status-bar-only cluster indicator.
 - Visual Lovelace editor for selecting the entities used by each parameter.
 - HACS-ready repository layout with the installable card in `dist/proxmox-dashboard-card.js`.
 
@@ -42,6 +43,8 @@ You can also configure it directly in YAML:
 ```yaml
 type: custom:proxmox-dashboard-card
 title: Proxmox Cluster
+show_details: false
+collapsible: true
 thresholds:
   cpu:
     warning: 70
@@ -104,6 +107,11 @@ nodes:
 ```
 
 All entity names above are anonymized examples. Replace them with the entities created by your Proxmox integration.
+
+## Display Options
+
+- `show_details`: Set to `false` to start the card in compact mode with only the black status indicator strip visible.
+- `collapsible`: Set to `true` to show a Details button that expands or collapses the summary and node sections. Set to `false` if you want the configured `show_details` mode to be fixed.
 
 ## Entity Mapping
 

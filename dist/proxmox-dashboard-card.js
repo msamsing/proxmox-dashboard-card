@@ -1,4 +1,4 @@
-const PROXMOX_DASHBOARD_CARD_VERSION = "0.1.2";
+const PROXMOX_DASHBOARD_CARD_VERSION = "0.1.3";
 const PROXMOX_DASHBOARD_CARD_TYPE = "proxmox-dashboard-card";
 
 const DEFAULT_THRESHOLDS = {
@@ -122,6 +122,8 @@ function normalizeConfig(config) {
   return {
     ...config,
     title: config.title || "Proxmox Cluster",
+    show_details: config.show_details !== false,
+    collapsible: config.collapsible !== false,
     thresholds: deepMerge(DEFAULT_THRESHOLDS, config.thresholds || {}),
     nodes: Array.isArray(config.nodes) ? config.nodes : [],
   };
@@ -269,6 +271,7 @@ class ProxmoxDashboardCard extends HTMLElement {
     this._config = undefined;
     this._hass = undefined;
     this._renderQueued = false;
+    this._detailsVisible = undefined;
   }
 
   static getConfigElement() {
@@ -297,7 +300,12 @@ class ProxmoxDashboardCard extends HTMLElement {
 
   setConfig(config) {
     if (!config) throw new Error("Invalid configuration");
-    this._config = normalizeConfig(config);
+    const normalized = normalizeConfig(config);
+    const previousShowDetails = this._config?.show_details;
+    this._config = normalized;
+    if (this._detailsVisible === undefined || previousShowDetails !== normalized.show_details) {
+      this._detailsVisible = normalized.show_details;
+    }
     this._scheduleRender();
   }
 
@@ -308,7 +316,13 @@ class ProxmoxDashboardCard extends HTMLElement {
 
   getCardSize() {
     const nodes = this._config?.nodes?.length || 1;
+    if (!this._detailsAreVisible()) return 3;
     return Math.max(6, Math.min(12, 4 + nodes * 2));
+  }
+
+  _detailsAreVisible() {
+    if (!this._config) return false;
+    return this._config.collapsible ? this._detailsVisible !== false : this._config.show_details !== false;
   }
 
   _scheduleRender() {
@@ -489,6 +503,7 @@ class ProxmoxDashboardCard extends HTMLElement {
     if (!this._config) return;
     const cluster = this._clusterModel();
     const hasNodes = cluster.nodes.length > 0;
+    const detailsVisible = this._detailsAreVisible();
 
     this.shadowRoot.innerHTML = `
       <style>${this._styles()}</style>
@@ -499,18 +514,54 @@ class ProxmoxDashboardCard extends HTMLElement {
               <p class="eyebrow">Proxmox observability</p>
               <h2>${html(this._config.title)}</h2>
             </div>
-            <div class="overall overall-${cluster.overall}">
-              <span class="pulse"></span>
-              <strong>${labelForLevel(cluster.overall)}</strong>
+            <div class="header-actions">
+              <div class="overall overall-${cluster.overall}">
+                <span class="pulse"></span>
+                <strong>${labelForLevel(cluster.overall)}</strong>
+              </div>
+              ${hasNodes && this._config.collapsible ? this._renderDetailsToggle(detailsVisible) : ""}
             </div>
           </header>
 
           ${hasNodes ? this._renderDashboardStrip(cluster) : this._renderEmptyState()}
-          ${hasNodes ? this._renderClusterSummary(cluster) : ""}
-          ${hasNodes ? `<div class="node-grid">${cluster.nodes.map((node) => this._renderNode(node)).join("")}</div>` : ""}
+          ${
+            hasNodes && detailsVisible
+              ? `
+                <section class="details-panel">
+                  ${this._renderClusterSummary(cluster)}
+                  <div class="node-grid">${cluster.nodes.map((node) => this._renderNode(node)).join("")}</div>
+                </section>
+              `
+              : ""
+          }
         </section>
       </ha-card>
     `;
+    this._attachCardEvents();
+  }
+
+  _renderDetailsToggle(detailsVisible) {
+    return `
+      <button
+        class="details-toggle"
+        type="button"
+        aria-expanded="${detailsVisible ? "true" : "false"}"
+        aria-label="${detailsVisible ? "Hide Proxmox details" : "Show Proxmox details"}"
+        title="${detailsVisible ? "Hide details" : "Show details"}"
+      >
+        <span class="toggle-icon" aria-hidden="true">${detailsVisible ? "^" : "v"}</span>
+        <span>Details</span>
+      </button>
+    `;
+  }
+
+  _attachCardEvents() {
+    const toggle = this.shadowRoot.querySelector(".details-toggle");
+    if (!toggle) return;
+    toggle.addEventListener("click", () => {
+      this._detailsVisible = !this._detailsAreVisible();
+      this._scheduleRender();
+    });
   }
 
   _renderDashboardStrip(cluster) {
@@ -766,6 +817,14 @@ class ProxmoxDashboardCard extends HTMLElement {
         gap: 16px;
       }
 
+      .header-actions {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
       .eyebrow {
         margin: 0 0 3px;
         color: var(--pdc-muted);
@@ -812,6 +871,34 @@ class ProxmoxDashboardCard extends HTMLElement {
         border-radius: 999px;
         background: currentColor;
         box-shadow: 0 0 0 5px color-mix(in srgb, currentColor 18%, transparent);
+      }
+
+      .details-toggle {
+        min-height: 36px;
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        padding: 7px 10px;
+        border: 1px solid var(--pdc-border);
+        border-radius: 8px;
+        color: var(--pdc-text);
+        background: var(--pdc-card-soft);
+        font: inherit;
+        font-size: 0.82rem;
+        font-weight: 800;
+        cursor: pointer;
+      }
+
+      .details-toggle:focus-visible {
+        outline: 2px solid var(--primary-color, #03a9f4);
+        outline-offset: 2px;
+      }
+
+      .toggle-icon {
+        width: 16px;
+        display: inline-grid;
+        place-items: center;
+        color: var(--pdc-muted);
       }
 
       .overall-ok,
@@ -910,6 +997,11 @@ class ProxmoxDashboardCard extends HTMLElement {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
         gap: 10px;
+      }
+
+      .details-panel {
+        display: grid;
+        gap: 14px;
       }
 
       .summary-item {
@@ -1279,8 +1371,18 @@ class ProxmoxDashboardCard extends HTMLElement {
           flex-direction: column;
         }
 
-        .overall {
+        .header-actions,
+        .overall,
+        .details-toggle {
           width: 100%;
+        }
+
+        .header-actions {
+          justify-content: stretch;
+        }
+
+        .overall,
+        .details-toggle {
           justify-content: center;
         }
 
@@ -1325,6 +1427,10 @@ class ProxmoxDashboardCardEditor extends HTMLElement {
         <section class="panel">
           <h3>Card</h3>
           ${this._textField("Title", "title", this._config.title || "")}
+          <div class="grid two card-options">
+            ${this._checkboxField("Show details by default", "show_details", this._config.show_details !== false)}
+            ${this._checkboxField("Show details toggle button", "collapsible", this._config.collapsible !== false)}
+          </div>
         </section>
 
         <section class="panel">
@@ -1489,6 +1595,15 @@ class ProxmoxDashboardCardEditor extends HTMLElement {
     `;
   }
 
+  _checkboxField(label, path, checked) {
+    return `
+      <label class="checkbox-field">
+        <input type="checkbox" data-path="${html(path)}" ${checked ? "checked" : ""}>
+        <span>${html(label)}</span>
+      </label>
+    `;
+  }
+
   _entityField(label, path, value) {
     return `
       <label class="field">
@@ -1522,7 +1637,7 @@ class ProxmoxDashboardCardEditor extends HTMLElement {
     this.shadowRoot.querySelectorAll("input, select").forEach((input) => {
       input.addEventListener("change", (event) => {
         const target = event.currentTarget;
-        const value = target.type === "number" ? parseNumber(target.value) : target.value;
+        const value = target.type === "checkbox" ? target.checked : target.type === "number" ? parseNumber(target.value) : target.value;
         this._updatePath(target.dataset.path, value);
       });
     });
@@ -1742,6 +1857,24 @@ class ProxmoxDashboardCardEditor extends HTMLElement {
       .field {
         display: grid;
         gap: 5px;
+      }
+
+      .card-options {
+        padding: 12px 0 0;
+      }
+
+      .checkbox-field {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        min-height: 40px;
+        color: var(--primary-text-color, #17202a);
+        font-weight: 700;
+      }
+
+      .checkbox-field input {
+        width: 18px;
+        height: 18px;
       }
 
       .field span {
