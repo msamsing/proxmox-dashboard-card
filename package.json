@@ -1,0 +1,17 @@
+{
+  "name": "proxmox-dashboard-card",
+  "version": "0.1.0",
+  "description": "A Home Assistant Lovelace custom card for Proxmox cluster health.",
+  "type": "module",
+  "scripts": {
+    "check": "node --check dist/proxmox-dashboard-card.js"
+  },
+  "keywords": [
+    "home-assistant",
+    "lovelace",
+    "hacs",
+    "proxmox",
+    "dashboard"
+  ],
+  "license": "MIT"
+}

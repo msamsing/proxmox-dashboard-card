@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Proxmox Dashboard Card Mock-up</title>
+    <script type="module" src="../dist/proxmox-dashboard-card.js"></script>
+    <style>
+      :root {
+        --primary-text-color: #17202a;
+        --secondary-text-color: #5b6573;
+        --card-background-color: #ffffff;
+        --divider-color: rgba(127, 139, 153, 0.28);
+        --primary-color: #008fbe;
+        --ha-card-border-radius: 8px;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: start center;
+        padding: 32px;
+        color: var(--primary-text-color);
+        background:
+          linear-gradient(135deg, rgba(40, 199, 111, 0.08), transparent 34%),
+          linear-gradient(315deg, rgba(255, 176, 32, 0.1), transparent 34%),
+          #eef2f6;
+      }
+
+      main {
+        width: min(1180px, 100%);
+      }
+
+      proxmox-dashboard-card {
+        display: block;
+      }
+
+      ha-card {
+        display: block;
+        border: 1px solid rgba(127, 139, 153, 0.22);
+        box-shadow: 0 18px 45px rgba(28, 37, 50, 0.13);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <proxmox-dashboard-card id="card"></proxmox-dashboard-card>
+    </main>
+
+    <script type="module">
+      const states = {
+        "sensor.node_a_status": state("Running"),
+        "sensor.node_a_cpu": state("31.4", "%"),
+        "sensor.node_a_memory": state("62.7", "%"),
+        "sensor.node_a_disk": state("48.2", "%"),
+        "sensor.node_a_temperature": state("43", "C"),
+        "sensor.node_a_vms_running": state("5"),
+        "sensor.node_a_lxcs_running": state("3"),
+        "sensor.node_a_last_boot": state("6 days ago"),
+        "sensor.node_a_updates": state("0"),
+        "sensor.node_a_updates_packages": state("OK"),
+        "sensor.node_a_local_used": state("52", "%"),
+        "sensor.node_a_zfs_used": state("64", "%"),
+        "sensor.node_a_nvme0_health": state("OK"),
+        "sensor.node_a_nvme0_temp": state("44", "C"),
+        "sensor.node_a_nvme0_wearout": state("2", "%"),
+        "sensor.node_a_sata0_health": state("OK"),
+        "sensor.node_a_sata0_temp": state("39", "C"),
+        "sensor.node_a_sata0_wearout": state("11", "%"),
+        "sensor.vm_router_status": state("Running"),
+        "sensor.vm_router_cpu": state("18", "%"),
+        "sensor.vm_router_memory": state("46", "%"),
+        "sensor.lxc_dns_status": state("Running"),
+        "sensor.lxc_dns_cpu": state("7", "%"),
+        "sensor.lxc_dns_memory": state("32", "%"),
+
+        "sensor.node_b_status": state("Running"),
+        "sensor.node_b_cpu": state("76", "%"),
+        "sensor.node_b_memory": state("82", "%"),
+        "sensor.node_b_disk": state("71", "%"),
+        "sensor.node_b_temperature": state("52", "C"),
+        "sensor.node_b_vms_running": state("4"),
+        "sensor.node_b_lxcs_running": state("2"),
+        "sensor.node_b_last_boot": state("13 days ago"),
+        "sensor.node_b_updates": state("12"),
+        "sensor.node_b_updates_packages": state("Update available"),
+        "sensor.node_b_local_used": state("78", "%"),
+        "sensor.node_b_backup_used": state("69", "%"),
+        "sensor.node_b_nvme0_health": state("OK"),
+        "sensor.node_b_nvme0_temp": state("55", "C"),
+        "sensor.node_b_nvme0_wearout": state("9", "%"),
+        "sensor.node_b_sata0_health": state("OK"),
+        "sensor.node_b_sata0_temp": state("47", "C"),
+        "sensor.node_b_sata0_wearout": state("18", "%"),
+        "sensor.vm_media_status": state("Running"),
+        "sensor.vm_media_cpu": state("64", "%"),
+        "sensor.vm_media_memory": state("78", "%"),
+        "sensor.lxc_monitoring_status": state("Running"),
+        "sensor.lxc_monitoring_cpu": state("24", "%"),
+        "sensor.lxc_monitoring_memory": state("58", "%"),
+
+        "sensor.node_c_status": state("Running"),
+        "sensor.node_c_cpu": state("21", "%"),
+        "sensor.node_c_memory": state("48", "%"),
+        "sensor.node_c_disk": state("88", "%"),
+        "sensor.node_c_temperature": state("61", "C"),
+        "sensor.node_c_vms_running": state("3"),
+        "sensor.node_c_lxcs_running": state("4"),
+        "sensor.node_c_last_boot": state("3 weeks ago"),
+        "sensor.node_c_updates": state("35"),
+        "sensor.node_c_updates_packages": state("Reboot required"),
+        "sensor.node_c_local_used": state("91", "%"),
+        "sensor.node_c_ceph_used": state("86", "%"),
+        "sensor.node_c_nvme0_health": state("OK"),
+        "sensor.node_c_nvme0_temp": state("62", "C"),
+        "sensor.node_c_nvme0_wearout": state("4", "%"),
+        "sensor.node_c_sata0_health": state("Failed"),
+        "sensor.node_c_sata0_temp": state("58", "C"),
+        "sensor.node_c_sata0_wearout": state("73", "%"),
+        "sensor.vm_db_status": state("Running"),
+        "sensor.vm_db_cpu": state("33", "%"),
+        "sensor.vm_db_memory": state("91", "%"),
+        "sensor.lxc_backup_status": state("Stopped"),
+        "sensor.lxc_backup_cpu": state("0", "%"),
+        "sensor.lxc_backup_memory": state("0", "%"),
+      };
+
+      function state(value, unit = undefined) {
+        return {
+          state: String(value),
+          attributes: unit ? { unit_of_measurement: unit } : {},
+        };
+      }
+
+      const hass = {
+        states,
+        formatEntityState(entity) {
+          const unit = entity.attributes?.unit_of_measurement;
+          return `${entity.state}${unit ? ` ${unit}` : ""}`;
+        },
+      };
+
+      const config = {
+        type: "custom:proxmox-dashboard-card",
+        title: "Proxmox Cluster",
+        nodes: [
+          node("Node A", "node_a", [
+            storage("local-zfs", "sensor.node_a_zfs_used"),
+            storage("local", "sensor.node_a_local_used"),
+          ], [
+            disk("NVMe 0", "sensor.node_a_nvme0_health", "sensor.node_a_nvme0_temp", "sensor.node_a_nvme0_wearout"),
+            disk("SATA 0", "sensor.node_a_sata0_health", "sensor.node_a_sata0_temp", "sensor.node_a_sata0_wearout"),
+          ], [
+            guest("Router", "vm", "sensor.vm_router_status", "sensor.vm_router_cpu", "sensor.vm_router_memory"),
+            guest("DNS", "lxc", "sensor.lxc_dns_status", "sensor.lxc_dns_cpu", "sensor.lxc_dns_memory"),
+          ]),
+          node("Node B", "node_b", [
+            storage("local", "sensor.node_b_local_used"),
+            storage("backup", "sensor.node_b_backup_used"),
+          ], [
+            disk("NVMe 0", "sensor.node_b_nvme0_health", "sensor.node_b_nvme0_temp", "sensor.node_b_nvme0_wearout"),
+            disk("SATA 0", "sensor.node_b_sata0_health", "sensor.node_b_sata0_temp", "sensor.node_b_sata0_wearout"),
+          ], [
+            guest("Media", "vm", "sensor.vm_media_status", "sensor.vm_media_cpu", "sensor.vm_media_memory"),
+            guest("Monitoring", "lxc", "sensor.lxc_monitoring_status", "sensor.lxc_monitoring_cpu", "sensor.lxc_monitoring_memory"),
+          ]),
+          node("Node C", "node_c", [
+            storage("local", "sensor.node_c_local_used"),
+            storage("ceph", "sensor.node_c_ceph_used"),
+          ], [
+            disk("NVMe 0", "sensor.node_c_nvme0_health", "sensor.node_c_nvme0_temp", "sensor.node_c_nvme0_wearout"),
+            disk("SATA 0", "sensor.node_c_sata0_health", "sensor.node_c_sata0_temp", "sensor.node_c_sata0_wearout"),
+          ], [
+            guest("Database", "vm", "sensor.vm_db_status", "sensor.vm_db_cpu", "sensor.vm_db_memory"),
+            guest("Backup", "lxc", "sensor.lxc_backup_status", "sensor.lxc_backup_cpu", "sensor.lxc_backup_memory"),
+          ]),
+        ],
+      };
+
+      function node(name, key, storages, disks, guests) {
+        return {
+          name,
+          status_entity: `sensor.${key}_status`,
+          cpu_entity: `sensor.${key}_cpu`,
+          memory_used_percentage_entity: `sensor.${key}_memory`,
+          disk_used_percentage_entity: `sensor.${key}_disk`,
+          temperature_entity: `sensor.${key}_temperature`,
+          virtual_machines_running_entity: `sensor.${key}_vms_running`,
+          containers_running_entity: `sensor.${key}_lxcs_running`,
+          last_boot_entity: `sensor.${key}_last_boot`,
+          updates_entity: `sensor.${key}_updates`,
+          updates_packages_entity: `sensor.${key}_updates_packages`,
+          storages,
+          disks,
+          guests,
+        };
+      }
+
+      function storage(name, used) {
+        return { name, used_percentage_entity: used };
+      }
+
+      function disk(name, health, temperature, wearout) {
+        return { name, health_entity: health, temperature_entity: temperature, wearout_entity: wearout };
+      }
+
+      function guest(name, type, status, cpu, memory) {
+        return { name, type, status_entity: status, cpu_entity: cpu, memory_used_percentage_entity: memory };
+      }
+
+      const card = document.querySelector("#card");
+      card.setConfig(config);
+      card.hass = hass;
+    </script>
+  </body>
+</html>
