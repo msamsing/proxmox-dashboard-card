@@ -1,4 +1,4 @@
-const PROXMOX_DASHBOARD_CARD_VERSION = "0.1.1";
+const PROXMOX_DASHBOARD_CARD_VERSION = "0.1.2";
 const PROXMOX_DASHBOARD_CARD_TYPE = "proxmox-dashboard-card";
 
 const DEFAULT_THRESHOLDS = {
@@ -167,10 +167,13 @@ function worstLevel(levels, fallback = "ok") {
   const knownLevels = (levels || []).filter(Boolean);
   if (!knownLevels.length) return fallback;
 
-  return knownLevels.reduce((worst, level) => {
+  const actionableLevels = knownLevels.filter((level) => level !== "unknown");
+  if (!actionableLevels.length) return "unknown";
+
+  return actionableLevels.reduce((worst, level) => {
     if (!level) return worst;
     return LEVELS[level] > LEVELS[worst] ? level : worst;
-  }, knownLevels[0]);
+  }, actionableLevels[0]);
 }
 
 function levelForValue(value, thresholds) {
@@ -184,8 +187,16 @@ function levelForStatus(rawState) {
   if (rawState === undefined || rawState === null || rawState === "") return "unknown";
   const state = String(rawState).trim().toLowerCase();
 
-  if (["ok", "online", "running", "healthy", "active", "on", "ready", "available", "true"].includes(state)) {
+  if (
+    ["ok", "online", "running", "healthy", "active", "on", "ready", "available", "true", "passed", "pass", "good", "enabled"].includes(
+      state,
+    )
+  ) {
     return "ok";
+  }
+
+  if (["unknown", "unavailable", "none", "null", "not configured"].includes(state)) {
+    return "unknown";
   }
 
   if (
@@ -215,8 +226,6 @@ function levelForStatus(rawState) {
       "offline",
       "down",
       "unhealthy",
-      "unavailable",
-      "unknown",
       "not ok",
       "false",
       "lost",
@@ -943,12 +952,15 @@ class ProxmoxDashboardCard extends HTMLElement {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
         gap: 14px;
+        align-items: start;
       }
 
       .node-card {
         min-width: 0;
         display: grid;
         gap: 13px;
+        align-content: start;
+        align-self: start;
         padding: 14px;
         border: 1px solid var(--pdc-border);
         border-top: 4px solid var(--node-level-color, var(--pdc-unknown));
