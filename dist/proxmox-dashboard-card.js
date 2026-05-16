@@ -1,5 +1,8 @@
-const PROXMOX_DASHBOARD_CARD_VERSION = "0.1.5";
+const PROXMOX_DASHBOARD_CARD_VERSION = "0.2.0";
 const PROXMOX_DASHBOARD_CARD_TYPE = "proxmox-dashboard-card";
+const DEFAULT_ALERT_DELAY_SECONDS = 300;
+const STATISTICS_WINDOW_MS = 60 * 60 * 1000;
+const STATISTICS_MAX_SAMPLES = 180;
 
 const DEFAULT_THRESHOLDS = {
   cpu: { warning: 70, critical: 90 },
@@ -119,11 +122,16 @@ function deepMerge(base, override) {
 }
 
 function normalizeConfig(config) {
+  const alertDelay = Number(config.alert_delay_seconds);
+
   return {
     ...config,
     title: config.title || "Proxmox Cluster",
     show_details: config.show_details !== false,
     collapsible: config.collapsible !== false,
+    show_statistics: config.show_statistics === true,
+    statistics_collapsible: config.statistics_collapsible !== false,
+    alert_delay_seconds: Number.isFinite(alertDelay) ? Math.max(0, alertDelay) : DEFAULT_ALERT_DELAY_SECONDS,
     thresholds: deepMerge(DEFAULT_THRESHOLDS, config.thresholds || {}),
     nodes: Array.isArray(config.nodes) ? config.nodes : [],
   };
@@ -252,8 +260,25 @@ function labelForLevel(level) {
   return "Unknown";
 }
 
+function isAlarmLevel(level) {
+  return level === "warn" || level === "critical";
+}
+
 function isConfigured(value) {
   return value !== undefined && value !== null && String(value).trim() !== "";
+}
+
+function sourceKey(...parts) {
+  return parts
+    .map((part) =>
+      String(part ?? "item")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, ""),
+    )
+    .filter(Boolean)
+    .join(":");
 }
 
 function icon(kind) {
@@ -282,6 +307,14 @@ class ProxmoxDashboardCard extends HTMLElement {
     this._hass = undefined;
     this._renderQueued = false;
     this._detailsVisible = undefined;
+    this._statisticsVisible = undefined;
+    this._delayedAlerts = new Map();
+    this._indicatorLatches = new Map();
+    this._acknowledgedAlerts = new Map();
+    this._currentIndicatorSignatures = new Map();
+    this._statisticsSamples = new Map();
+    this._statisticsTriggered = new Map();
+    this._alertTimer = undefined;
   }
 
   static getConfigElement() {
@@ -312,9 +345,13 @@ class ProxmoxDashboardCard extends HTMLElement {
     if (!config) throw new Error("Invalid configuration");
     const normalized = normalizeConfig(config);
     const previousShowDetails = this._config?.show_details;
+    const previousShowStatistics = this._config?.show_statistics;
     this._config = normalized;
     if (this._detailsVisible === undefined || previousShowDetails !== normalized.show_details) {
       this._detailsVisible = normalized.show_details;
+    }
+    if (this._statisticsVisible === undefined || previousShowStatistics !== normalized.show_statistics) {
+      this._statisticsVisible = normalized.show_statistics;
     }
     this._scheduleRender();
   }
@@ -326,13 +363,19 @@ class ProxmoxDashboardCard extends HTMLElement {
 
   getCardSize() {
     const nodes = this._config?.nodes?.length || 1;
-    if (!this._detailsAreVisible()) return 3;
-    return Math.max(6, Math.min(12, 4 + nodes * 2));
+    let size = this._detailsAreVisible() ? Math.max(6, Math.min(12, 4 + nodes * 2)) : 3;
+    if (this._statisticsAreVisible()) size += 3;
+    return size;
   }
 
   _detailsAreVisible() {
     if (!this._config) return false;
     return this._config.collapsible ? this._detailsVisible !== false : this._config.show_details !== false;
+  }
+
+  _statisticsAreVisible() {
+    if (!this._config) return false;
+    return this._config.statistics_collapsible ? this._statisticsVisible === true : this._config.show_statistics === true;
   }
 
   _scheduleRender() {
@@ -368,32 +411,287 @@ class ProxmoxDashboardCard extends HTMLElement {
     return `${entity.state}${unit ? ` ${unit}` : ""}`;
   }
 
+  _alertDelayMs() {
+    return Math.max(0, Number(this._config?.alert_delay_seconds || 0) * 1000);
+  }
+
+  _scheduleAlarmRefresh(delayMs) {
+    if (!Number.isFinite(delayMs) || delayMs <= 0) return;
+    const delay = Math.max(50, Math.ceil(delayMs));
+    if (this._alertTimer) window.clearTimeout(this._alertTimer);
+    this._alertTimer = window.setTimeout(() => {
+      this._alertTimer = undefined;
+      this._scheduleRender();
+    }, delay);
+  }
+
+  _delayedMetricLevel(key, rawLevel) {
+    if (!isAlarmLevel(rawLevel)) {
+      this._delayedAlerts.delete(key);
+      return rawLevel;
+    }
+
+    const delayMs = this._alertDelayMs();
+    if (delayMs === 0) return rawLevel;
+
+    const now = Date.now();
+    const existing = this._delayedAlerts.get(key);
+    const startedAt = existing?.startedAt || now;
+    const level = LEVELS[rawLevel] > LEVELS[existing?.level] ? rawLevel : existing?.level || rawLevel;
+    this._delayedAlerts.set(key, { startedAt, level });
+
+    const elapsed = now - startedAt;
+    if (elapsed >= delayMs) return level;
+
+    this._scheduleAlarmRefresh(delayMs - elapsed);
+    return "ok";
+  }
+
+  _numericSource({ key, label, category, value, unit = "%", warning, critical, level }) {
+    return {
+      key,
+      label,
+      category,
+      value,
+      unit,
+      warning,
+      critical,
+      level,
+      numeric: Number.isFinite(value),
+    };
+  }
+
+  _statusSource({ key, label, category, state, level }) {
+    return {
+      key,
+      label,
+      category,
+      state: state ?? "--",
+      level,
+      numeric: false,
+    };
+  }
+
+  _recordStatisticSample(source) {
+    if (!source?.key) return;
+    const now = Date.now();
+    const samples = this._statisticsSamples.get(source.key) || [];
+    const sample = {
+      time: now,
+      value: source.numeric ? source.value : isAlarmLevel(source.level) ? 1 : 0,
+      state: source.state,
+      level: source.level,
+    };
+    const last = samples[samples.length - 1];
+
+    if (last && now - last.time < 5000) {
+      samples[samples.length - 1] = sample;
+    } else {
+      samples.push(sample);
+    }
+
+    const cutoff = now - STATISTICS_WINDOW_MS;
+    while (samples.length > STATISTICS_MAX_SAMPLES || (samples[0] && samples[0].time < cutoff)) {
+      samples.shift();
+    }
+
+    this._statisticsSamples.set(source.key, samples);
+  }
+
+  _markStatisticTriggered(source) {
+    if (!source?.key || !isAlarmLevel(source.level)) return;
+    const now = Date.now();
+    const existing = this._statisticsTriggered.get(source.key);
+    this._statisticsTriggered.set(source.key, {
+      ...existing,
+      source: { ...source },
+      firstSeen: existing?.firstSeen || now,
+      lastSeen: now,
+      level: worstLevel([existing?.level, source.level], source.level),
+    });
+  }
+
+  _activeSources(sources) {
+    return (sources || []).filter((source) => source && isAlarmLevel(source.level));
+  }
+
+  _sourceSignature(indicator, activeSources) {
+    if (!activeSources.length) return `${indicator.key}:${indicator.level}`;
+    return activeSources
+      .map((source) => `${source.key}:${source.level}`)
+      .sort()
+      .join("|");
+  }
+
+  _applyIndicatorState(indicator) {
+    const activeSources = this._activeSources(indicator.sources);
+    const signature = this._sourceSignature(indicator, activeSources);
+    const latch = this._indicatorLatches.get(indicator.key);
+    this._currentIndicatorSignatures.set(indicator.key, { signature, level: indicator.level });
+
+    if (isAlarmLevel(indicator.level)) {
+      activeSources.forEach((source) => this._markStatisticTriggered(source));
+
+      if (this._acknowledgedAlerts.get(indicator.key) === signature) {
+        return { ...indicator, displayLevel: "ok", acknowledged: true, activeSources };
+      }
+
+      const latchedLevel = worstLevel([latch?.level, indicator.level], indicator.level);
+      this._indicatorLatches.set(indicator.key, {
+        level: latchedLevel,
+        signature,
+        sources: activeSources,
+        firstSeen: latch?.firstSeen || Date.now(),
+      });
+
+      return { ...indicator, displayLevel: latchedLevel, latched: true, activeSources };
+    }
+
+    this._acknowledgedAlerts.delete(indicator.key);
+
+    if (latch) {
+      latch.sources?.forEach((source) => this._markStatisticTriggered(source));
+      return { ...indicator, displayLevel: latch.level, latched: true, activeSources: latch.sources || [] };
+    }
+
+    return { ...indicator, displayLevel: indicator.level, activeSources };
+  }
+
   _nodeModel(node) {
     const thresholds = this._config.thresholds;
     const cpu = this._number(node.cpu_entity);
     const memory = this._number(node.memory_used_percentage_entity);
     const disk = this._number(node.disk_used_percentage_entity);
     const temp = this._number(node.temperature_entity);
-    const storages = (node.storages || []).map((storage) => this._storageModel(storage));
-    const disks = (node.disks || []).map((diskItem) => this._diskModel(diskItem));
-    const guests = (node.guests || []).map((guest) => this._guestModel(guest));
+    const nodeName = node.name || "Node";
+    const storages = (node.storages || []).map((storage) => this._storageModel(storage, nodeName));
+    const disks = (node.disks || []).map((diskItem) => this._diskModel(diskItem, nodeName));
+    const guests = (node.guests || []).map((guest) => this._guestModel(guest, nodeName));
     const updates = this._number(node.updates_entity);
+    const cpuLevel = node.cpu_entity ? levelForValue(cpu, thresholds.cpu) : undefined;
+    const memoryLevel = node.memory_used_percentage_entity ? levelForValue(memory, thresholds.memory) : undefined;
+    const diskLevel = node.disk_used_percentage_entity ? levelForValue(disk, thresholds.disk) : undefined;
+    const tempLevel = node.temperature_entity ? levelForValue(temp, thresholds.disk_temperature) : undefined;
+    const updateLevel = node.updates_entity ? levelForValue(updates, thresholds.updates) : undefined;
+    const statusLevel = node.status_entity ? levelForStatus(this._stateValue(node.status_entity)) : undefined;
+    const packageLevel = node.updates_packages_entity ? levelForStatus(this._stateValue(node.updates_packages_entity)) : undefined;
+    const cpuSource = node.cpu_entity
+      ? this._numericSource({
+          key: sourceKey("node", nodeName, "cpu"),
+          label: `${nodeName} CPU`,
+          category: "Load",
+          value: cpu,
+          warning: thresholds.cpu.warning,
+          critical: thresholds.cpu.critical,
+          level: cpuLevel,
+        })
+      : undefined;
+    const memorySource = node.memory_used_percentage_entity
+      ? this._numericSource({
+          key: sourceKey("node", nodeName, "memory"),
+          label: `${nodeName} memory`,
+          category: "Memory",
+          value: memory,
+          warning: thresholds.memory.warning,
+          critical: thresholds.memory.critical,
+          level: memoryLevel,
+        })
+      : undefined;
+    const diskSource = node.disk_used_percentage_entity
+      ? this._numericSource({
+          key: sourceKey("node", nodeName, "disk"),
+          label: `${nodeName} node disk`,
+          category: "Disk",
+          value: disk,
+          warning: thresholds.disk.warning,
+          critical: thresholds.disk.critical,
+          level: diskLevel,
+        })
+      : undefined;
+    const tempSource = node.temperature_entity
+      ? this._numericSource({
+          key: sourceKey("node", nodeName, "temperature"),
+          label: `${nodeName} temperature`,
+          category: "Temperature",
+          value: temp,
+          unit: "deg",
+          warning: thresholds.disk_temperature.warning,
+          critical: thresholds.disk_temperature.critical,
+          level: tempLevel,
+        })
+      : undefined;
+    const updateSource = node.updates_entity
+      ? this._numericSource({
+          key: sourceKey("node", nodeName, "updates"),
+          label: `${nodeName} updates`,
+          category: "Updates",
+          value: updates,
+          unit: "",
+          warning: thresholds.updates.warning,
+          critical: thresholds.updates.critical,
+          level: updateLevel,
+        })
+      : undefined;
+    const statusSource = node.status_entity
+      ? this._statusSource({
+          key: sourceKey("node", nodeName, "status"),
+          label: `${nodeName} status`,
+          category: "Nodes",
+          state: this._display(node.status_entity, "--"),
+          level: statusLevel,
+        })
+      : undefined;
+    const packageSource = node.updates_packages_entity
+      ? this._statusSource({
+          key: sourceKey("node", nodeName, "update-packages"),
+          label: `${nodeName} update packages`,
+          category: "Updates",
+          state: this._display(node.updates_packages_entity, "--"),
+          level: packageLevel,
+        })
+      : undefined;
+    [cpuSource, memorySource, diskSource, tempSource, updateSource, statusSource, packageSource].forEach((source) =>
+      this._recordStatisticSample(source),
+    );
+    [diskSource, tempSource, updateSource, statusSource, packageSource].forEach((source) => this._markStatisticTriggered(source));
+    const delayedCpuLevel = cpuSource ? this._delayedMetricLevel(cpuSource.key, cpuLevel) : undefined;
+    const delayedMemoryLevel = memorySource ? this._delayedMetricLevel(memorySource.key, memoryLevel) : undefined;
+    const cpuAlarmSource = cpuSource ? { ...cpuSource, level: delayedCpuLevel } : undefined;
+    const memoryAlarmSource = memorySource ? { ...memorySource, level: delayedMemoryLevel } : undefined;
+    [cpuAlarmSource, memoryAlarmSource].forEach((source) => this._markStatisticTriggered(source));
 
     const levels = [];
-    if (node.status_entity) levels.push(levelForStatus(this._stateValue(node.status_entity)));
-    if (node.cpu_entity) levels.push(levelForValue(cpu, thresholds.cpu));
-    if (node.memory_used_percentage_entity) levels.push(levelForValue(memory, thresholds.memory));
-    if (node.disk_used_percentage_entity) levels.push(levelForValue(disk, thresholds.disk));
-    if (node.temperature_entity) levels.push(levelForValue(temp, thresholds.disk_temperature));
-    if (node.updates_entity) levels.push(levelForValue(updates, thresholds.updates));
-    if (node.updates_packages_entity) levels.push(levelForStatus(this._stateValue(node.updates_packages_entity)));
+    const alarmLevels = [];
+    if (node.status_entity) levels.push(statusLevel);
+    if (node.cpu_entity) levels.push(cpuLevel);
+    if (node.memory_used_percentage_entity) levels.push(memoryLevel);
+    if (node.disk_used_percentage_entity) levels.push(diskLevel);
+    if (node.temperature_entity) levels.push(tempLevel);
+    if (node.updates_entity) levels.push(updateLevel);
+    if (node.updates_packages_entity) levels.push(packageLevel);
     levels.push(...storages.map((storage) => storage.level));
     levels.push(...disks.map((diskItem) => diskItem.level));
     levels.push(...guests.map((guest) => guest.level));
+    alarmLevels.push(statusLevel, delayedCpuLevel, delayedMemoryLevel, diskLevel, tempLevel, updateLevel, packageLevel);
+    alarmLevels.push(...storages.map((storage) => storage.level));
+    alarmLevels.push(...disks.map((diskItem) => diskItem.level));
+    alarmLevels.push(...guests.map((guest) => guest.level));
+    const sources = [
+      statusSource,
+      cpuAlarmSource,
+      memoryAlarmSource,
+      diskSource,
+      tempSource,
+      updateSource,
+      packageSource,
+      ...storages.flatMap((storage) => storage.sources || []),
+      ...disks.flatMap((diskItem) => diskItem.sources || []),
+      ...guests.flatMap((guest) => guest.sources || []),
+    ].filter(Boolean);
 
     return {
       raw: node,
-      name: node.name || "Node",
+      name: nodeName,
       status: this._display(node.status_entity, "Not configured"),
       cpu,
       memory,
@@ -404,10 +702,21 @@ class ProxmoxDashboardCard extends HTMLElement {
       disks,
       guests,
       level: worstLevel(levels, "unknown"),
+      alarmLevel: worstLevel(alarmLevels, "unknown"),
+      sources,
+      cpuSource,
+      cpuAlarmSource,
+      memorySource,
+      memoryAlarmSource,
+      diskSource,
+      tempSource,
+      updateSource,
+      packageSource,
+      statusSource,
     };
   }
 
-  _storageModel(storage) {
+  _storageModel(storage, nodeName) {
     const thresholds = this._config.thresholds.storage;
     let used = this._number(storage.used_percentage_entity);
     const total = this._number(storage.total_entity);
@@ -420,50 +729,141 @@ class ProxmoxDashboardCard extends HTMLElement {
     const levels = [];
     if (storage.status_entity) levels.push(levelForStatus(this._stateValue(storage.status_entity)));
     if (storage.used_percentage_entity || storage.used_entity) levels.push(levelForValue(used, thresholds));
+    const usedLevel = storage.used_percentage_entity || storage.used_entity ? levelForValue(used, thresholds) : undefined;
+    const statusLevel = storage.status_entity ? levelForStatus(this._stateValue(storage.status_entity)) : undefined;
+    const usedSource =
+      storage.used_percentage_entity || storage.used_entity
+        ? this._numericSource({
+            key: sourceKey("storage", nodeName, storage.name || "storage", "used"),
+            label: `${nodeName} ${storage.name || "storage"} used`,
+            category: "Storage",
+            value: used,
+            warning: thresholds.warning,
+            critical: thresholds.critical,
+            level: usedLevel,
+          })
+        : undefined;
+    const statusSource = storage.status_entity
+      ? this._statusSource({
+          key: sourceKey("storage", nodeName, storage.name || "storage", "status"),
+          label: `${nodeName} ${storage.name || "storage"} status`,
+          category: "Storage",
+          state: this._display(storage.status_entity, "--"),
+          level: statusLevel,
+        })
+      : undefined;
+    const sources = [usedSource, statusSource].filter(Boolean);
+    sources.forEach((source) => {
+      this._recordStatisticSample(source);
+      this._markStatisticTriggered(source);
+    });
 
     return {
       raw: storage,
       name: storage.name || "Storage",
       used,
       level: worstLevel(levels, "unknown"),
+      sources,
     };
   }
 
-  _diskModel(disk) {
+  _diskModel(disk, nodeName) {
     const temperature = this._number(disk.temperature_entity);
     const wearout = this._number(disk.wearout_entity);
     const levels = [];
-    if (disk.health_entity) levels.push(levelForStatus(this._stateValue(disk.health_entity)));
-    if (disk.temperature_entity) levels.push(levelForValue(temperature, this._config.thresholds.disk_temperature));
-    if (disk.wearout_entity) levels.push(levelForValue(wearout, this._config.thresholds.wearout));
+    const healthLevel = disk.health_entity ? levelForStatus(this._stateValue(disk.health_entity)) : undefined;
+    const temperatureLevel = disk.temperature_entity ? levelForValue(temperature, this._config.thresholds.disk_temperature) : undefined;
+    const wearoutLevel = disk.wearout_entity ? levelForValue(wearout, this._config.thresholds.wearout) : undefined;
+    if (disk.health_entity) levels.push(healthLevel);
+    if (disk.temperature_entity) levels.push(temperatureLevel);
+    if (disk.wearout_entity) levels.push(wearoutLevel);
+    const diskName = disk.name || "Disk";
+    const healthSource = disk.health_entity
+      ? this._statusSource({
+          key: sourceKey("disk", nodeName, diskName, "health"),
+          label: `${nodeName} ${diskName} health`,
+          category: "Disks",
+          state: this._display(disk.health_entity, "--"),
+          level: healthLevel,
+        })
+      : undefined;
+    const temperatureSource = disk.temperature_entity
+      ? this._numericSource({
+          key: sourceKey("disk", nodeName, diskName, "temperature"),
+          label: `${nodeName} ${diskName} temperature`,
+          category: "Temperature",
+          value: temperature,
+          unit: "deg",
+          warning: this._config.thresholds.disk_temperature.warning,
+          critical: this._config.thresholds.disk_temperature.critical,
+          level: temperatureLevel,
+        })
+      : undefined;
+    const wearoutSource = disk.wearout_entity
+      ? this._numericSource({
+          key: sourceKey("disk", nodeName, diskName, "wearout"),
+          label: `${nodeName} ${diskName} wearout`,
+          category: "Disks",
+          value: wearout,
+          warning: this._config.thresholds.wearout.warning,
+          critical: this._config.thresholds.wearout.critical,
+          level: wearoutLevel,
+        })
+      : undefined;
+    const sources = [healthSource, temperatureSource, wearoutSource].filter(Boolean);
+    sources.forEach((source) => {
+      this._recordStatisticSample(source);
+      this._markStatisticTriggered(source);
+    });
 
     return {
       raw: disk,
-      name: disk.name || "Disk",
+      name: diskName,
       temperature,
       wearout,
       level: worstLevel(levels, "unknown"),
+      sources,
     };
   }
 
-  _guestModel(guest) {
+  _guestModel(guest, nodeName) {
     const cpu = this._number(guest.cpu_entity);
     const memory = this._number(guest.memory_used_percentage_entity);
     const disk = this._number(guest.disk_used_percentage_entity);
     const levels = [];
-    if (guest.status_entity) levels.push(levelForStatus(this._stateValue(guest.status_entity)));
-    if (guest.cpu_entity) levels.push(levelForValue(cpu, this._config.thresholds.cpu));
-    if (guest.memory_used_percentage_entity) levels.push(levelForValue(memory, this._config.thresholds.memory));
-    if (guest.disk_used_percentage_entity) levels.push(levelForValue(disk, this._config.thresholds.disk));
+    const statusLevel = guest.status_entity ? levelForStatus(this._stateValue(guest.status_entity)) : undefined;
+    const cpuLevel = guest.cpu_entity ? levelForValue(cpu, this._config.thresholds.cpu) : undefined;
+    const memoryLevel = guest.memory_used_percentage_entity ? levelForValue(memory, this._config.thresholds.memory) : undefined;
+    const diskLevel = guest.disk_used_percentage_entity ? levelForValue(disk, this._config.thresholds.disk) : undefined;
+    if (guest.status_entity) levels.push(statusLevel);
+    if (guest.cpu_entity) levels.push(cpuLevel);
+    if (guest.memory_used_percentage_entity) levels.push(memoryLevel);
+    if (guest.disk_used_percentage_entity) levels.push(diskLevel);
+    const guestName = guest.name || "Guest";
+    const statusSource = guest.status_entity
+      ? this._statusSource({
+          key: sourceKey("guest", nodeName, guestName, "status"),
+          label: `${nodeName} ${guestName} status`,
+          category: "VM/LXC",
+          state: this._display(guest.status_entity, "--"),
+          level: statusLevel,
+        })
+      : undefined;
+    const sources = [statusSource].filter(Boolean);
+    sources.forEach((source) => {
+      this._recordStatisticSample(source);
+      this._markStatisticTriggered(source);
+    });
 
     return {
       raw: guest,
-      name: guest.name || "Guest",
+      name: guestName,
       type: guest.type || "vm",
       cpu,
       memory,
       disk,
       level: worstLevel(levels, "unknown"),
+      sources,
     };
   }
 
@@ -491,10 +891,18 @@ class ProxmoxDashboardCard extends HTMLElement {
       rawNodes.some((node) => isConfigured(node.temperature_entity)) ||
       rawNodes.some((node) => (node.disks || []).some((disk) => isConfigured(disk.temperature_entity)));
     const hasUpdates = rawNodes.some((node) => isConfigured(node.updates_entity) || isConfigured(node.updates_packages_entity));
-    const loadLevels = nodes.flatMap((node) => [
-      Number.isFinite(node.cpu) ? levelForValue(node.cpu, this._config.thresholds.cpu) : undefined,
-      Number.isFinite(node.memory) ? levelForValue(node.memory, this._config.thresholds.memory) : undefined,
-    ]);
+    const loadSources = nodes.map((node) => node.cpuAlarmSource).filter(Boolean);
+    const memorySources = nodes.map((node) => node.memoryAlarmSource).filter(Boolean);
+    const storageSources = allStorages.flatMap((storage) => storage.sources || []);
+    const diskSources = allDisks.flatMap((disk) => disk.sources || []);
+    const tempSources = [
+      ...nodes.map((node) => node.tempSource).filter(Boolean),
+      ...allDisks.flatMap((disk) => (disk.sources || []).filter((source) => source.category === "Temperature")),
+    ];
+    const updateSources = nodes.flatMap((node) => [node.updateSource, node.packageSource]).filter(Boolean);
+    const nodeSources = nodes.flatMap((node) => node.sources || []);
+    const loadLevels = loadSources.map((source) => source.level);
+    const memoryLevels = memorySources.map((source) => source.level);
     const guestCountLevels = nodes.flatMap((node) => [
       isConfigured(node.raw.virtual_machines_running_entity) ? (Number.isFinite(this._number(node.raw.virtual_machines_running_entity)) ? "ok" : "unknown") : undefined,
       isConfigured(node.raw.containers_running_entity) ? (Number.isFinite(this._number(node.raw.containers_running_entity)) ? "ok" : "unknown") : undefined,
@@ -508,34 +916,54 @@ class ProxmoxDashboardCard extends HTMLElement {
       node.raw.updates_packages_entity ? levelForStatus(this._stateValue(node.raw.updates_packages_entity)) : undefined,
     ]);
     const indicators = [
-      hasCluster ? { key: "cluster", label: "Cluster", icon: "cluster", level: worstLevel(nodes.map((node) => node.level), "unknown") } : undefined,
-      hasNodeStatus ? { key: "nodes", label: "Nodes", icon: "server", level: worstLevel(nodes.map((node) => node.level), "unknown") } : undefined,
+      hasCluster
+        ? {
+            key: "cluster",
+            label: "Cluster",
+            icon: "cluster",
+            level: worstLevel(nodes.map((node) => node.alarmLevel), "unknown"),
+            sources: nodeSources,
+          }
+        : undefined,
+      hasNodeStatus
+        ? {
+            key: "nodes",
+            label: "Nodes",
+            icon: "server",
+            level: worstLevel(nodes.map((node) => node.alarmLevel), "unknown"),
+            sources: nodeSources,
+          }
+        : undefined,
       hasGuests
         ? {
             key: "guests",
             label: "VM/LXC",
             icon: "guest",
             level: allGuests.length ? worstLevel(allGuests.map((guest) => guest.level)) : worstLevel(guestCountLevels, "unknown"),
+            sources: allGuests.flatMap((guest) => guest.sources || []),
           }
         : undefined,
-      hasLoad ? { key: "load", label: "Load", icon: "gauge", level: worstLevel(loadLevels, "unknown") } : undefined,
+      hasLoad ? { key: "load", label: "Load", icon: "gauge", level: worstLevel(loadLevels, "unknown"), sources: loadSources } : undefined,
       hasMemory
         ? {
             key: "memory",
             label: "Memory",
             icon: "memory",
-            level: worstLevel(nodes.map((node) => (Number.isFinite(node.memory) ? levelForValue(node.memory, this._config.thresholds.memory) : undefined)), "unknown"),
+            level: worstLevel(memoryLevels, "unknown"),
+            sources: memorySources,
           }
         : undefined,
-      hasStorage ? { key: "storage", label: "Storage", icon: "storage", level: worstLevel(allStorages.map((storage) => storage.level), "unknown") } : undefined,
-      hasDisks ? { key: "disks", label: "Disks", icon: "disk", level: worstLevel(allDisks.map((disk) => disk.level), "unknown") } : undefined,
-      hasTemperature ? { key: "temperature", label: "Temp", icon: "thermometer", level: worstLevel(temperatureLevels, "unknown") } : undefined,
-      hasUpdates ? { key: "updates", label: "Updates", icon: "updates", level: worstLevel(updateLevels, "unknown") } : undefined,
-    ].filter(Boolean);
+      hasStorage ? { key: "storage", label: "Storage", icon: "storage", level: worstLevel(allStorages.map((storage) => storage.level), "unknown"), sources: storageSources } : undefined,
+      hasDisks ? { key: "disks", label: "Disks", icon: "disk", level: worstLevel(allDisks.map((disk) => disk.level), "unknown"), sources: diskSources } : undefined,
+      hasTemperature ? { key: "temperature", label: "Temp", icon: "thermometer", level: worstLevel(temperatureLevels, "unknown"), sources: tempSources } : undefined,
+      hasUpdates ? { key: "updates", label: "Updates", icon: "updates", level: worstLevel(updateLevels, "unknown"), sources: updateSources } : undefined,
+    ]
+      .filter(Boolean)
+      .map((indicator) => this._applyIndicatorState(indicator));
 
     return {
       nodes,
-      overall: worstLevel(nodes.map((node) => node.level), "unknown"),
+      overall: worstLevel(indicators.map((indicator) => indicator.displayLevel), "unknown"),
       indicators,
       totals: {
         nodes: nodes.length,
@@ -552,6 +980,7 @@ class ProxmoxDashboardCard extends HTMLElement {
     const cluster = this._clusterModel();
     const hasNodes = cluster.nodes.length > 0;
     const detailsVisible = this._detailsAreVisible();
+    const statisticsVisible = this._statisticsAreVisible();
 
     this.shadowRoot.innerHTML = `
       <style>${this._styles()}</style>
@@ -568,10 +997,12 @@ class ProxmoxDashboardCard extends HTMLElement {
                 <strong>${labelForLevel(cluster.overall)}</strong>
               </div>
               ${hasNodes && this._config.collapsible ? this._renderDetailsToggle(detailsVisible) : ""}
+              ${hasNodes && this._config.show_statistics && this._config.statistics_collapsible ? this._renderStatisticsToggle(statisticsVisible) : ""}
             </div>
           </header>
 
           ${hasNodes ? this._renderDashboardStrip(cluster) : this._renderEmptyState()}
+          ${hasNodes && statisticsVisible ? this._renderStatisticsSection() : ""}
           ${
             hasNodes && detailsVisible
               ? `
@@ -591,7 +1022,7 @@ class ProxmoxDashboardCard extends HTMLElement {
   _renderDetailsToggle(detailsVisible) {
     return `
       <button
-        class="details-toggle"
+        class="details-toggle details-view-toggle"
         type="button"
         aria-expanded="${detailsVisible ? "true" : "false"}"
         aria-label="${detailsVisible ? "Hide Proxmox details" : "Show Proxmox details"}"
@@ -603,12 +1034,42 @@ class ProxmoxDashboardCard extends HTMLElement {
     `;
   }
 
+  _renderStatisticsToggle(statisticsVisible) {
+    return `
+      <button
+        class="details-toggle statistics-toggle"
+        type="button"
+        aria-expanded="${statisticsVisible ? "true" : "false"}"
+        aria-label="${statisticsVisible ? "Hide Proxmox statistics" : "Show Proxmox statistics"}"
+        title="${statisticsVisible ? "Hide statistics" : "Show statistics"}"
+      >
+        <span class="toggle-icon" aria-hidden="true">${statisticsVisible ? "^" : "v"}</span>
+        <span>Statistics</span>
+      </button>
+    `;
+  }
+
   _attachCardEvents() {
-    const toggle = this.shadowRoot.querySelector(".details-toggle");
-    if (!toggle) return;
-    toggle.addEventListener("click", () => {
+    const toggle = this.shadowRoot.querySelector(".details-view-toggle");
+    toggle?.addEventListener("click", () => {
       this._detailsVisible = !this._detailsAreVisible();
       this._scheduleRender();
+    });
+    const statisticsToggle = this.shadowRoot.querySelector(".statistics-toggle");
+    statisticsToggle?.addEventListener("click", () => {
+      this._statisticsVisible = !this._statisticsAreVisible();
+      this._scheduleRender();
+    });
+    this.shadowRoot.querySelectorAll(".indicator").forEach((indicator) => {
+      indicator.addEventListener("click", () => {
+        const key = indicator.dataset.indicatorKey;
+        const latch = this._indicatorLatches.get(key);
+        const current = this._currentIndicatorSignatures.get(key);
+        if (latch?.signature) this._acknowledgedAlerts.set(key, latch.signature);
+        else if (current?.signature && isAlarmLevel(current.level)) this._acknowledgedAlerts.set(key, current.signature);
+        this._indicatorLatches.delete(key);
+        this._scheduleRender();
+      });
     });
   }
 
@@ -618,10 +1079,16 @@ class ProxmoxDashboardCard extends HTMLElement {
         ${cluster.indicators
           .map(
             (item) => `
-              <div class="indicator indicator-${item.level}" title="${html(item.label)}: ${labelForLevel(item.level)}" aria-label="${html(item.label)} ${labelForLevel(item.level)}">
+              <button
+                class="indicator indicator-${item.displayLevel}"
+                type="button"
+                data-indicator-key="${html(item.key)}"
+                title="${html(item.label)}: ${labelForLevel(item.displayLevel)}${item.latched ? " (latched, click to acknowledge)" : ""}"
+                aria-label="${html(item.label)} ${labelForLevel(item.displayLevel)}"
+              >
                 <div class="indicator-icon">${icon(item.icon)}</div>
                 <span>${html(item.label)}</span>
-              </div>
+              </button>
             `,
           )
           .join("")}
@@ -652,6 +1119,106 @@ class ProxmoxDashboardCard extends HTMLElement {
           )
           .join("")}
       </section>
+    `;
+  }
+
+  _statisticsItems() {
+    return [...this._statisticsTriggered.values()]
+      .sort((a, b) => b.lastSeen - a.lastSeen)
+      .slice(0, 8)
+      .map((item) => ({
+        ...item,
+        samples: this._statisticsSamples.get(item.source.key) || [],
+      }));
+  }
+
+  _renderStatisticsSection() {
+    const items = this._statisticsItems();
+
+    return `
+      <section class="statistics-panel">
+        <div class="statistics-header">
+          <div>
+            <h3>Statistics</h3>
+            <p>${items.length ? "Threshold-triggering parameters since this card was loaded." : "No statusbar warnings have been triggered since this card was loaded."}</p>
+          </div>
+        </div>
+        ${
+          items.length
+            ? `<div class="statistics-grid">${items.map((item) => this._renderStatisticItem(item)).join("")}</div>`
+            : ""
+        }
+      </section>
+    `;
+  }
+
+  _renderStatisticItem(item) {
+    const source = item.source;
+    const current = source.numeric && Number.isFinite(source.value) ? `${compactNumber(source.value)}${source.unit || ""}` : html(source.state || labelForLevel(item.level));
+
+    return `
+      <article class="stat-card stat-${item.level}">
+        <div class="stat-topline">
+          <div>
+            <strong>${html(source.label)}</strong>
+            <span>${html(source.category)} · ${labelForLevel(item.level)}</span>
+          </div>
+          <b>${current}</b>
+        </div>
+        ${source.numeric ? this._renderNumericStatisticChart(source, item.samples) : this._renderStatusStatisticChart(item)}
+      </article>
+    `;
+  }
+
+  _renderNumericStatisticChart(source, samples) {
+    const chartSamples = samples.filter((sample) => Number.isFinite(sample.value));
+    const width = 320;
+    const height = 92;
+    const padding = 12;
+    const now = Date.now();
+    const start = chartSamples[0]?.time || now - 1;
+    const end = Math.max(now, chartSamples[chartSamples.length - 1]?.time || now);
+    const maxValue = Math.max(source.critical || 0, source.warning || 0, ...chartSamples.map((sample) => sample.value), 1) * 1.12;
+    const x = (time) => padding + ((time - start) / Math.max(1, end - start)) * (width - padding * 2);
+    const y = (value) => height - padding - (clamp(value, 0, maxValue) / maxValue) * (height - padding * 2);
+    const points = chartSamples.map((sample) => `${x(sample.time).toFixed(1)},${y(sample.value).toFixed(1)}`).join(" ");
+    const warningY = y(source.warning);
+    const criticalY = y(source.critical);
+    const bands = chartSamples
+      .slice(0, -1)
+      .map((sample, index) => {
+        const next = chartSamples[index + 1];
+        const level = levelForValue(sample.value, { warning: source.warning, critical: source.critical });
+        if (!isAlarmLevel(level)) return "";
+        const bandX = x(sample.time);
+        const bandWidth = Math.max(2, x(next.time) - bandX);
+        return `<rect class="stat-band stat-band-${level}" x="${bandX.toFixed(1)}" y="8" width="${bandWidth.toFixed(1)}" height="${height - 16}"></rect>`;
+      })
+      .join("");
+
+    return `
+      <svg class="stat-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="${html(source.label)} history">
+        <rect class="stat-chart-bg" x="0" y="0" width="${width}" height="${height}"></rect>
+        ${bands}
+        <line class="threshold critical" x1="${padding}" x2="${width - padding}" y1="${criticalY.toFixed(1)}" y2="${criticalY.toFixed(1)}"></line>
+        <line class="threshold warning" x1="${padding}" x2="${width - padding}" y1="${warningY.toFixed(1)}" y2="${warningY.toFixed(1)}"></line>
+        <polyline class="stat-line" points="${html(points)}"></polyline>
+      </svg>
+      <div class="stat-legend">
+        <span>Warn ${compactNumber(source.warning)}${html(source.unit || "")}</span>
+        <span>Critical ${compactNumber(source.critical)}${html(source.unit || "")}</span>
+      </div>
+    `;
+  }
+
+  _renderStatusStatisticChart(item) {
+    return `
+      <div class="status-stat-chart status-stat-${item.level}">
+        <span>${html(item.source.state || labelForLevel(item.level))}</span>
+      </div>
+      <div class="stat-legend">
+        <span>State triggered the statusbar</span>
+      </div>
     `;
   }
 
@@ -1011,8 +1578,16 @@ class ProxmoxDashboardCard extends HTMLElement {
         place-items: center;
         gap: 5px;
         padding: 10px 4px 8px;
+        border: 0;
         border-radius: 6px;
         background: color-mix(in srgb, currentColor 7%, transparent);
+        font: inherit;
+        cursor: pointer;
+      }
+
+      .indicator:focus-visible {
+        outline: 2px solid color-mix(in srgb, currentColor 70%, white 30%);
+        outline-offset: 2px;
       }
 
       .indicator-icon {
@@ -1050,6 +1625,151 @@ class ProxmoxDashboardCard extends HTMLElement {
       .details-panel {
         display: grid;
         gap: 14px;
+      }
+
+      .statistics-panel {
+        display: grid;
+        gap: 12px;
+        padding: 14px;
+        border: 1px solid var(--pdc-border);
+        border-radius: 8px;
+        background: var(--pdc-card-soft);
+      }
+
+      .statistics-header {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .statistics-header h3 {
+        margin: 0;
+        font-size: 1rem;
+      }
+
+      .statistics-header p {
+        margin-top: 4px;
+        color: var(--pdc-muted);
+        font-size: 0.82rem;
+      }
+
+      .statistics-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 10px;
+      }
+
+      .stat-card {
+        min-width: 0;
+        display: grid;
+        gap: 9px;
+        padding: 10px;
+        border: 1px solid color-mix(in srgb, currentColor 26%, var(--pdc-border));
+        border-radius: 8px;
+        background: var(--pdc-card);
+        color: var(--pdc-text);
+      }
+
+      .stat-warn {
+        --stat-color: var(--pdc-warn);
+      }
+
+      .stat-critical {
+        --stat-color: var(--pdc-critical);
+      }
+
+      .stat-topline {
+        min-width: 0;
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .stat-topline div {
+        min-width: 0;
+        display: grid;
+        gap: 2px;
+      }
+
+      .stat-topline strong {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .stat-topline span,
+      .stat-legend {
+        color: var(--pdc-muted);
+        font-size: 0.72rem;
+        font-weight: 700;
+      }
+
+      .stat-topline b {
+        color: var(--stat-color, var(--pdc-warn));
+        white-space: nowrap;
+      }
+
+      .stat-chart {
+        width: 100%;
+        height: 92px;
+        overflow: hidden;
+        border-radius: 6px;
+      }
+
+      .stat-chart-bg {
+        fill: rgba(127, 139, 153, 0.1);
+      }
+
+      .stat-band {
+        opacity: 0.16;
+      }
+
+      .stat-band-warn {
+        fill: var(--pdc-warn);
+      }
+
+      .stat-band-critical {
+        fill: var(--pdc-critical);
+      }
+
+      .threshold {
+        stroke-width: 1.5;
+        stroke-dasharray: 5 4;
+      }
+
+      .threshold.warning {
+        stroke: var(--pdc-warn);
+      }
+
+      .threshold.critical {
+        stroke: var(--pdc-critical);
+      }
+
+      .stat-line {
+        fill: none;
+        stroke: var(--stat-color, var(--pdc-warn));
+        stroke-width: 3;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .status-stat-chart {
+        min-height: 74px;
+        display: grid;
+        place-items: center;
+        border-radius: 6px;
+        color: var(--stat-color, var(--pdc-warn));
+        background: color-mix(in srgb, currentColor 10%, transparent);
+        font-size: 1rem;
+        font-weight: 900;
+      }
+
+      .stat-legend {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
       }
 
       .summary-item {
@@ -1478,6 +2198,9 @@ class ProxmoxDashboardCardEditor extends HTMLElement {
           <div class="grid two card-options">
             ${this._checkboxField("Show details by default", "show_details", this._config.show_details !== false)}
             ${this._checkboxField("Show details toggle button", "collapsible", this._config.collapsible !== false)}
+            ${this._checkboxField("Show statistics by default", "show_statistics", this._config.show_statistics === true)}
+            ${this._checkboxField("Show statistics toggle button", "statistics_collapsible", this._config.statistics_collapsible !== false)}
+            ${this._numberField("Load/memory alert delay (seconds)", "alert_delay_seconds", this._config.alert_delay_seconds)}
           </div>
         </section>
 

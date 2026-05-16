@@ -13,6 +13,9 @@ A Home Assistant Lovelace custom card for monitoring a Proxmox cluster at a glan
 - Storage pool usage bars.
 - VM and LXC rows with status dots and compact load bars.
 - Collapsible details view, so the card can run as a compact status-bar-only cluster indicator.
+- Delayed load and memory alerts to avoid statusbar reactions to short spikes.
+- Click-to-acknowledge status indicators that stay amber/red until acknowledged.
+- Optional Statistics section showing the parameters that triggered statusbar warnings.
 - Visual Lovelace editor for selecting the entities used by each parameter.
 - HACS-ready repository layout with the installable card in `dist/proxmox-dashboard-card.js`.
 
@@ -46,6 +49,9 @@ type: custom:proxmox-dashboard-card
 title: Proxmox Cluster
 show_details: false
 collapsible: true
+show_statistics: true
+statistics_collapsible: true
+alert_delay_seconds: 300
 thresholds:
   cpu:
     warning: 70
@@ -113,6 +119,9 @@ All entity names above are anonymized examples. Replace them with the entities c
 
 - `show_details`: Set to `false` to start the card in compact mode with only the black status indicator strip visible.
 - `collapsible`: Set to `true` to show a Details button that expands or collapses the summary and node sections. Set to `false` if you want the configured `show_details` mode to be fixed.
+- `show_statistics`: Set to `true` to show the Statistics section.
+- `statistics_collapsible`: Set to `true` to show a Statistics button that expands or collapses the section.
+- `alert_delay_seconds`: Number of seconds CPU and memory must stay above threshold before the statusbar reacts. Defaults to `300`.
 
 ## Entity Mapping
 
@@ -164,9 +173,11 @@ If `used_percentage_entity` is not set for storage, the card can calculate usage
 The card combines the configured status entities and thresholds into one overall state:
 
 - Green: values are below warning thresholds and status entities are healthy.
-- Amber: values exceed warning thresholds, updates are available, a guest is stopped, or a status reports a warning/degraded state.
+- Amber: values exceed warning thresholds long enough to pass the configured alert delay, updates are available, a guest is stopped, or a status reports a warning/degraded state.
 - Red: values exceed critical thresholds, a disk reports failed/problem health, or an entity reports offline/failed/unavailable.
 - Gray: a category has not been configured or cannot be evaluated yet.
+
+Load and memory alerts are delayed by `alert_delay_seconds` before they affect the statusbar and the aggregate Cluster/Nodes indicators. Other health signals, such as disk problems and storage thresholds, react immediately. Once a statusbar icon turns amber or red, it stays latched until the icon is clicked. Clicking acknowledges the current condition and returns that icon to green unless the condition escalates or a new condition appears.
 
 ## Development
 

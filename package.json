@@ -1,6 +1,6 @@
 {
   "name": "proxmox-dashboard-card",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "A Home Assistant Lovelace custom card for Proxmox cluster health.",
   "type": "module",
   "scripts": {
