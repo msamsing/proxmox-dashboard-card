@@ -7,6 +7,7 @@ A Home Assistant Lovelace custom card for monitoring a Proxmox cluster at a glan
 ## Highlights
 
 - Cluster-style warning strip inspired by vehicle and submarine status indicators, with server/computer symbols instead of vehicle symbols.
+- The status strip only shows configured categories, for example Cluster only appears when more than one node is configured.
 - Per-node CPU, memory, and disk gauges with green, amber, and red health states.
 - Physical disk status with health, temperature, and wearout indicators.
 - Storage pool usage bars.

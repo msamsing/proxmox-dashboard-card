@@ -1,4 +1,4 @@
-const PROXMOX_DASHBOARD_CARD_VERSION = "0.1.3";
+const PROXMOX_DASHBOARD_CARD_VERSION = "0.1.4";
 const PROXMOX_DASHBOARD_CARD_TYPE = "proxmox-dashboard-card";
 
 const DEFAULT_THRESHOLDS = {
@@ -246,6 +246,10 @@ function labelForLevel(level) {
   return "Unknown";
 }
 
+function isConfigured(value) {
+  return value !== undefined && value !== null && String(value).trim() !== "";
+}
+
 function icon(kind) {
   const common = 'viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
   const icons = {
@@ -459,12 +463,35 @@ class ProxmoxDashboardCard extends HTMLElement {
 
   _clusterModel() {
     const nodes = this._config.nodes.map((node) => this._nodeModel(node));
+    const rawNodes = this._config.nodes;
     const allDisks = nodes.flatMap((node) => node.disks);
     const allStorages = nodes.flatMap((node) => node.storages);
     const allGuests = nodes.flatMap((node) => node.guests);
+    const hasCluster = nodes.length > 1;
+    const hasNodeStatus = nodes.length > 0;
+    const hasGuests =
+      allGuests.length > 0 ||
+      rawNodes.some((node) => isConfigured(node.virtual_machines_running_entity) || isConfigured(node.containers_running_entity));
+    const hasLoad = rawNodes.some((node) => isConfigured(node.cpu_entity));
+    const hasMemory = rawNodes.some(
+      (node) =>
+        isConfigured(node.memory_used_percentage_entity) ||
+        isConfigured(node.memory_used_entity) ||
+        isConfigured(node.memory_free_entity),
+    );
+    const hasStorage = allStorages.length > 0;
+    const hasDisks = allDisks.length > 0;
+    const hasTemperature =
+      rawNodes.some((node) => isConfigured(node.temperature_entity)) ||
+      rawNodes.some((node) => (node.disks || []).some((disk) => isConfigured(disk.temperature_entity)));
+    const hasUpdates = rawNodes.some((node) => isConfigured(node.updates_entity) || isConfigured(node.updates_packages_entity));
     const loadLevels = nodes.flatMap((node) => [
       Number.isFinite(node.cpu) ? levelForValue(node.cpu, this._config.thresholds.cpu) : undefined,
       Number.isFinite(node.memory) ? levelForValue(node.memory, this._config.thresholds.memory) : undefined,
+    ]);
+    const guestCountLevels = nodes.flatMap((node) => [
+      isConfigured(node.raw.virtual_machines_running_entity) ? (Number.isFinite(this._number(node.raw.virtual_machines_running_entity)) ? "ok" : "unknown") : undefined,
+      isConfigured(node.raw.containers_running_entity) ? (Number.isFinite(this._number(node.raw.containers_running_entity)) ? "ok" : "unknown") : undefined,
     ]);
     const temperatureLevels = [
       ...nodes.map((node) => (Number.isFinite(node.temp) ? levelForValue(node.temp, this._config.thresholds.disk_temperature) : undefined)),
@@ -474,21 +501,36 @@ class ProxmoxDashboardCard extends HTMLElement {
       node.raw.updates_entity ? levelForValue(node.updates, this._config.thresholds.updates) : undefined,
       node.raw.updates_packages_entity ? levelForStatus(this._stateValue(node.raw.updates_packages_entity)) : undefined,
     ]);
+    const indicators = [
+      hasCluster ? { key: "cluster", label: "Cluster", icon: "cluster", level: worstLevel(nodes.map((node) => node.level), "unknown") } : undefined,
+      hasNodeStatus ? { key: "nodes", label: "Nodes", icon: "server", level: worstLevel(nodes.map((node) => node.level), "unknown") } : undefined,
+      hasGuests
+        ? {
+            key: "guests",
+            label: "VM/LXC",
+            icon: "guest",
+            level: allGuests.length ? worstLevel(allGuests.map((guest) => guest.level)) : worstLevel(guestCountLevels, "unknown"),
+          }
+        : undefined,
+      hasLoad ? { key: "load", label: "Load", icon: "gauge", level: worstLevel(loadLevels, "unknown") } : undefined,
+      hasMemory
+        ? {
+            key: "memory",
+            label: "Memory",
+            icon: "memory",
+            level: worstLevel(nodes.map((node) => (Number.isFinite(node.memory) ? levelForValue(node.memory, this._config.thresholds.memory) : undefined)), "unknown"),
+          }
+        : undefined,
+      hasStorage ? { key: "storage", label: "Storage", icon: "storage", level: worstLevel(allStorages.map((storage) => storage.level), "unknown") } : undefined,
+      hasDisks ? { key: "disks", label: "Disks", icon: "disk", level: worstLevel(allDisks.map((disk) => disk.level), "unknown") } : undefined,
+      hasTemperature ? { key: "temperature", label: "Temp", icon: "thermometer", level: worstLevel(temperatureLevels, "unknown") } : undefined,
+      hasUpdates ? { key: "updates", label: "Updates", icon: "updates", level: worstLevel(updateLevels, "unknown") } : undefined,
+    ].filter(Boolean);
 
     return {
       nodes,
       overall: worstLevel(nodes.map((node) => node.level), "unknown"),
-      indicators: [
-        { key: "cluster", label: "Cluster", icon: "cluster", level: worstLevel(nodes.map((node) => node.level), "unknown") },
-        { key: "nodes", label: "Nodes", icon: "server", level: worstLevel(nodes.map((node) => node.level), "unknown") },
-        { key: "guests", label: "VM/LXC", icon: "guest", level: allGuests.length ? worstLevel(allGuests.map((guest) => guest.level)) : "unknown" },
-        { key: "load", label: "Load", icon: "gauge", level: worstLevel(loadLevels, "unknown") },
-        { key: "memory", label: "Memory", icon: "memory", level: worstLevel(nodes.map((node) => (Number.isFinite(node.memory) ? levelForValue(node.memory, this._config.thresholds.memory) : undefined)), "unknown") },
-        { key: "storage", label: "Storage", icon: "storage", level: allStorages.length ? worstLevel(allStorages.map((storage) => storage.level)) : "unknown" },
-        { key: "disks", label: "Disks", icon: "disk", level: allDisks.length ? worstLevel(allDisks.map((disk) => disk.level)) : "unknown" },
-        { key: "temperature", label: "Temp", icon: "thermometer", level: worstLevel(temperatureLevels, "unknown") },
-        { key: "updates", label: "Updates", icon: "updates", level: worstLevel(updateLevels, "unknown") },
-      ],
+      indicators,
       totals: {
         nodes: nodes.length,
         guests: allGuests.length,
