@@ -165,7 +165,7 @@ The card combines the configured status entities and thresholds into one overall
 
 - Green: values are below warning thresholds and status entities are healthy.
 - Amber: values exceed warning thresholds, updates are available, a guest is stopped, or a status reports a warning/degraded state.
-- Red: values exceed critical thresholds, a disk reports failed health, or an entity reports offline/failed/unavailable.
+- Red: values exceed critical thresholds, a disk reports failed/problem health, or an entity reports offline/failed/unavailable.
 - Gray: a category has not been configured or cannot be evaluated yet.
 
 ## Development

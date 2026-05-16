@@ -1,4 +1,4 @@
-const PROXMOX_DASHBOARD_CARD_VERSION = "0.1.4";
+const PROXMOX_DASHBOARD_CARD_VERSION = "0.1.5";
 const PROXMOX_DASHBOARD_CARD_TYPE = "proxmox-dashboard-card";
 
 const DEFAULT_THRESHOLDS = {
@@ -222,12 +222,18 @@ function levelForStatus(rawState) {
   if (
     [
       "critical",
+      "problem",
+      "problems",
       "error",
       "failed",
       "failure",
+      "failing",
       "offline",
       "down",
       "unhealthy",
+      "bad",
+      "smart failed",
+      "smart failure",
       "not ok",
       "false",
       "lost",
