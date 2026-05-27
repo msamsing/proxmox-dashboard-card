@@ -1,8 +1,8 @@
-const PROXMOX_DASHBOARD_CARD_VERSION = "0.2.0";
+const PROXMOX_DASHBOARD_CARD_VERSION = "0.2.1";
 const PROXMOX_DASHBOARD_CARD_TYPE = "proxmox-dashboard-card";
 const DEFAULT_ALERT_DELAY_SECONDS = 300;
-const STATISTICS_WINDOW_MS = 60 * 60 * 1000;
-const STATISTICS_MAX_SAMPLES = 180;
+const STATISTICS_WINDOW_MS = 24 * 60 * 60 * 1000;
+const STATISTICS_MAX_SAMPLES = 720;
 
 const DEFAULT_THRESHOLDS = {
   cpu: { warning: 70, critical: 90 },
@@ -11,7 +11,6 @@ const DEFAULT_THRESHOLDS = {
   storage: { warning: 75, critical: 90 },
   disk_temperature: { warning: 50, critical: 60 },
   wearout: { warning: 60, critical: 85 },
-  updates: { warning: 1, critical: 30 },
 };
 
 const LEVELS = {
@@ -169,6 +168,7 @@ function parseNumber(value) {
 function levelColor(level) {
   if (level === "critical") return "var(--pdc-critical)";
   if (level === "warn") return "var(--pdc-warn)";
+  if (level === "info") return "var(--pdc-info)";
   if (level === "ok") return "var(--pdc-ok)";
   return "var(--pdc-unknown)";
 }
@@ -177,7 +177,7 @@ function worstLevel(levels, fallback = "ok") {
   const knownLevels = (levels || []).filter(Boolean);
   if (!knownLevels.length) return fallback;
 
-  const actionableLevels = knownLevels.filter((level) => level !== "unknown");
+  const actionableLevels = knownLevels.filter((level) => level !== "unknown" && level !== "info" && LEVELS[level] !== undefined);
   if (!actionableLevels.length) return "unknown";
 
   return actionableLevels.reduce((worst, level) => {
@@ -253,9 +253,51 @@ function levelForStatus(rawState) {
   return "unknown";
 }
 
+function levelForUpdates(value) {
+  if (!Number.isFinite(value)) return "unknown";
+  return value > 0 ? "info" : "ok";
+}
+
+function levelForUpdateState(rawState) {
+  if (rawState === undefined || rawState === null || rawState === "") return "unknown";
+  const state = String(rawState).trim().toLowerCase();
+  const numeric = parseNumber(state);
+
+  if (Number.isFinite(numeric)) return numeric > 0 ? "info" : "ok";
+
+  if (["unknown", "unavailable", "none", "null", "not configured"].includes(state)) return "unknown";
+
+  if (
+    [
+      "ok",
+      "up to date",
+      "up-to-date",
+      "no updates",
+      "no update",
+      "no updates available",
+      "no update available",
+      "false",
+      "off",
+      "clear",
+      "idle",
+    ].includes(state)
+  ) {
+    return "ok";
+  }
+
+  return "info";
+}
+
+function updateIndicatorLevel(levels) {
+  const knownLevels = (levels || []).filter(Boolean);
+  if (knownLevels.includes("info")) return "info";
+  return worstLevel(knownLevels, "unknown");
+}
+
 function labelForLevel(level) {
   if (level === "critical") return "Critical";
   if (level === "warn") return "Attention";
+  if (level === "info") return "Info";
   if (level === "ok") return "Nominal";
   return "Unknown";
 }
@@ -314,6 +356,8 @@ class ProxmoxDashboardCard extends HTMLElement {
     this._currentIndicatorSignatures = new Map();
     this._statisticsSamples = new Map();
     this._statisticsTriggered = new Map();
+    this._statisticsHistory = new Map();
+    this._historyRequests = new Set();
     this._alertTimer = undefined;
   }
 
@@ -447,33 +491,37 @@ class ProxmoxDashboardCard extends HTMLElement {
     return "ok";
   }
 
-  _numericSource({ key, label, category, value, unit = "%", warning, critical, level }) {
+  _numericSource({ key, label, category, entityId, value, unit = "%", warning, critical, level, statistics = true }) {
     return {
       key,
       label,
       category,
+      entityId,
       value,
       unit,
       warning,
       critical,
       level,
-      numeric: Number.isFinite(value),
+      numeric: true,
+      statistics,
     };
   }
 
-  _statusSource({ key, label, category, state, level }) {
+  _statusSource({ key, label, category, entityId, state, level, statistics = true }) {
     return {
       key,
       label,
       category,
+      entityId,
       state: state ?? "--",
       level,
       numeric: false,
+      statistics,
     };
   }
 
   _recordStatisticSample(source) {
-    if (!source?.key) return;
+    if (!source?.key || source.statistics === false) return;
     const now = Date.now();
     const samples = this._statisticsSamples.get(source.key) || [];
     const sample = {
@@ -499,7 +547,7 @@ class ProxmoxDashboardCard extends HTMLElement {
   }
 
   _markStatisticTriggered(source) {
-    if (!source?.key || !isAlarmLevel(source.level)) return;
+    if (!source?.key || source.statistics === false || !isAlarmLevel(source.level)) return;
     const now = Date.now();
     const existing = this._statisticsTriggered.get(source.key);
     this._statisticsTriggered.set(source.key, {
@@ -509,6 +557,90 @@ class ProxmoxDashboardCard extends HTMLElement {
       lastSeen: now,
       level: worstLevel([existing?.level, source.level], source.level),
     });
+  }
+
+  _historyKey(source) {
+    return `${source.key}:${source.entityId || "local"}`;
+  }
+
+  _ensureHistory(source) {
+    if (!source?.entityId || source.statistics === false || !this._hass?.callApi) return;
+
+    const key = this._historyKey(source);
+    if (this._statisticsHistory.has(key) || this._historyRequests.has(key)) return;
+
+    this._historyRequests.add(key);
+    const start = encodeURIComponent(new Date(Date.now() - STATISTICS_WINDOW_MS).toISOString());
+    const query = new URLSearchParams({
+      filter_entity_id: source.entityId,
+      minimal_response: "true",
+      no_attributes: "true",
+    });
+
+    this._hass
+      .callApi("GET", `history/period/${start}?${query.toString()}`)
+      .then((history) => {
+        const rows = Array.isArray(history?.[0]) ? history[0] : [];
+        const samples = rows
+          .map((entry) => this._historySampleFromState(source, entry))
+          .filter(Boolean)
+          .sort((a, b) => a.time - b.time);
+        this._statisticsHistory.set(key, samples);
+      })
+      .catch(() => {
+        this._statisticsHistory.set(key, []);
+      })
+      .finally(() => {
+        this._historyRequests.delete(key);
+        this._scheduleRender();
+      });
+  }
+
+  _historySampleFromState(source, entry) {
+    const time = new Date(entry?.last_changed || entry?.last_updated || entry?.last_reported || 0).getTime();
+    if (!Number.isFinite(time) || time <= 0) return undefined;
+
+    if (source.numeric) {
+      const value = parseNumber(entry?.state);
+      if (!Number.isFinite(value)) return undefined;
+      return {
+        time,
+        value,
+        state: entry?.state,
+        level: levelForValue(value, { warning: source.warning, critical: source.critical }),
+      };
+    }
+
+    const state = entry?.state ?? "";
+    const level = levelForStatus(state);
+    return {
+      time,
+      value: isAlarmLevel(level) ? 1 : 0,
+      state,
+      level,
+    };
+  }
+
+  _samplesForSource(source) {
+    const fallback = this._statisticsSamples.get(source.key) || [];
+    this._ensureHistory(source);
+
+    const history = this._statisticsHistory.get(this._historyKey(source));
+    const base = history?.length ? history : fallback;
+    const lastHistorySample = history?.[history.length - 1];
+    const merged =
+      history?.length && fallback.length
+        ? [
+            ...history,
+            ...fallback.filter((sample) => !lastHistorySample || sample.time > lastHistorySample.time + 5000),
+          ]
+        : base;
+
+    const cutoff = Date.now() - STATISTICS_WINDOW_MS;
+    return merged
+      .filter((sample) => sample?.time >= cutoff)
+      .sort((a, b) => a.time - b.time)
+      .slice(-STATISTICS_MAX_SAMPLES);
   }
 
   _activeSources(sources) {
@@ -572,14 +704,15 @@ class ProxmoxDashboardCard extends HTMLElement {
     const memoryLevel = node.memory_used_percentage_entity ? levelForValue(memory, thresholds.memory) : undefined;
     const diskLevel = node.disk_used_percentage_entity ? levelForValue(disk, thresholds.disk) : undefined;
     const tempLevel = node.temperature_entity ? levelForValue(temp, thresholds.disk_temperature) : undefined;
-    const updateLevel = node.updates_entity ? levelForValue(updates, thresholds.updates) : undefined;
+    const updateLevel = node.updates_entity ? levelForUpdates(updates) : undefined;
     const statusLevel = node.status_entity ? levelForStatus(this._stateValue(node.status_entity)) : undefined;
-    const packageLevel = node.updates_packages_entity ? levelForStatus(this._stateValue(node.updates_packages_entity)) : undefined;
+    const packageLevel = node.updates_packages_entity ? levelForUpdateState(this._stateValue(node.updates_packages_entity)) : undefined;
     const cpuSource = node.cpu_entity
       ? this._numericSource({
           key: sourceKey("node", nodeName, "cpu"),
           label: `${nodeName} CPU`,
           category: "Load",
+          entityId: node.cpu_entity,
           value: cpu,
           warning: thresholds.cpu.warning,
           critical: thresholds.cpu.critical,
@@ -591,6 +724,7 @@ class ProxmoxDashboardCard extends HTMLElement {
           key: sourceKey("node", nodeName, "memory"),
           label: `${nodeName} memory`,
           category: "Memory",
+          entityId: node.memory_used_percentage_entity,
           value: memory,
           warning: thresholds.memory.warning,
           critical: thresholds.memory.critical,
@@ -602,6 +736,7 @@ class ProxmoxDashboardCard extends HTMLElement {
           key: sourceKey("node", nodeName, "disk"),
           label: `${nodeName} node disk`,
           category: "Disk",
+          entityId: node.disk_used_percentage_entity,
           value: disk,
           warning: thresholds.disk.warning,
           critical: thresholds.disk.critical,
@@ -613,6 +748,7 @@ class ProxmoxDashboardCard extends HTMLElement {
           key: sourceKey("node", nodeName, "temperature"),
           label: `${nodeName} temperature`,
           category: "Temperature",
+          entityId: node.temperature_entity,
           value: temp,
           unit: "deg",
           warning: thresholds.disk_temperature.warning,
@@ -625,11 +761,11 @@ class ProxmoxDashboardCard extends HTMLElement {
           key: sourceKey("node", nodeName, "updates"),
           label: `${nodeName} updates`,
           category: "Updates",
+          entityId: node.updates_entity,
           value: updates,
           unit: "",
-          warning: thresholds.updates.warning,
-          critical: thresholds.updates.critical,
           level: updateLevel,
+          statistics: false,
         })
       : undefined;
     const statusSource = node.status_entity
@@ -637,6 +773,7 @@ class ProxmoxDashboardCard extends HTMLElement {
           key: sourceKey("node", nodeName, "status"),
           label: `${nodeName} status`,
           category: "Nodes",
+          entityId: node.status_entity,
           state: this._display(node.status_entity, "--"),
           level: statusLevel,
         })
@@ -646,14 +783,16 @@ class ProxmoxDashboardCard extends HTMLElement {
           key: sourceKey("node", nodeName, "update-packages"),
           label: `${nodeName} update packages`,
           category: "Updates",
+          entityId: node.updates_packages_entity,
           state: this._display(node.updates_packages_entity, "--"),
           level: packageLevel,
+          statistics: false,
         })
       : undefined;
     [cpuSource, memorySource, diskSource, tempSource, updateSource, statusSource, packageSource].forEach((source) =>
       this._recordStatisticSample(source),
     );
-    [diskSource, tempSource, updateSource, statusSource, packageSource].forEach((source) => this._markStatisticTriggered(source));
+    [diskSource, tempSource, statusSource].forEach((source) => this._markStatisticTriggered(source));
     const delayedCpuLevel = cpuSource ? this._delayedMetricLevel(cpuSource.key, cpuLevel) : undefined;
     const delayedMemoryLevel = memorySource ? this._delayedMetricLevel(memorySource.key, memoryLevel) : undefined;
     const cpuAlarmSource = cpuSource ? { ...cpuSource, level: delayedCpuLevel } : undefined;
@@ -667,12 +806,10 @@ class ProxmoxDashboardCard extends HTMLElement {
     if (node.memory_used_percentage_entity) levels.push(memoryLevel);
     if (node.disk_used_percentage_entity) levels.push(diskLevel);
     if (node.temperature_entity) levels.push(tempLevel);
-    if (node.updates_entity) levels.push(updateLevel);
-    if (node.updates_packages_entity) levels.push(packageLevel);
     levels.push(...storages.map((storage) => storage.level));
     levels.push(...disks.map((diskItem) => diskItem.level));
     levels.push(...guests.map((guest) => guest.level));
-    alarmLevels.push(statusLevel, delayedCpuLevel, delayedMemoryLevel, diskLevel, tempLevel, updateLevel, packageLevel);
+    alarmLevels.push(statusLevel, delayedCpuLevel, delayedMemoryLevel, diskLevel, tempLevel);
     alarmLevels.push(...storages.map((storage) => storage.level));
     alarmLevels.push(...disks.map((diskItem) => diskItem.level));
     alarmLevels.push(...guests.map((guest) => guest.level));
@@ -682,8 +819,6 @@ class ProxmoxDashboardCard extends HTMLElement {
       memoryAlarmSource,
       diskSource,
       tempSource,
-      updateSource,
-      packageSource,
       ...storages.flatMap((storage) => storage.sources || []),
       ...disks.flatMap((diskItem) => diskItem.sources || []),
       ...guests.flatMap((guest) => guest.sources || []),
@@ -737,6 +872,7 @@ class ProxmoxDashboardCard extends HTMLElement {
             key: sourceKey("storage", nodeName, storage.name || "storage", "used"),
             label: `${nodeName} ${storage.name || "storage"} used`,
             category: "Storage",
+            entityId: storage.used_percentage_entity || undefined,
             value: used,
             warning: thresholds.warning,
             critical: thresholds.critical,
@@ -748,6 +884,7 @@ class ProxmoxDashboardCard extends HTMLElement {
           key: sourceKey("storage", nodeName, storage.name || "storage", "status"),
           label: `${nodeName} ${storage.name || "storage"} status`,
           category: "Storage",
+          entityId: storage.status_entity,
           state: this._display(storage.status_entity, "--"),
           level: statusLevel,
         })
@@ -783,6 +920,7 @@ class ProxmoxDashboardCard extends HTMLElement {
           key: sourceKey("disk", nodeName, diskName, "health"),
           label: `${nodeName} ${diskName} health`,
           category: "Disks",
+          entityId: disk.health_entity,
           state: this._display(disk.health_entity, "--"),
           level: healthLevel,
         })
@@ -792,6 +930,7 @@ class ProxmoxDashboardCard extends HTMLElement {
           key: sourceKey("disk", nodeName, diskName, "temperature"),
           label: `${nodeName} ${diskName} temperature`,
           category: "Temperature",
+          entityId: disk.temperature_entity,
           value: temperature,
           unit: "deg",
           warning: this._config.thresholds.disk_temperature.warning,
@@ -804,6 +943,7 @@ class ProxmoxDashboardCard extends HTMLElement {
           key: sourceKey("disk", nodeName, diskName, "wearout"),
           label: `${nodeName} ${diskName} wearout`,
           category: "Disks",
+          entityId: disk.wearout_entity,
           value: wearout,
           warning: this._config.thresholds.wearout.warning,
           critical: this._config.thresholds.wearout.critical,
@@ -845,8 +985,10 @@ class ProxmoxDashboardCard extends HTMLElement {
           key: sourceKey("guest", nodeName, guestName, "status"),
           label: `${nodeName} ${guestName} status`,
           category: "VM/LXC",
+          entityId: guest.status_entity,
           state: this._display(guest.status_entity, "--"),
           level: statusLevel,
+          statistics: false,
         })
       : undefined;
     const sources = [statusSource].filter(Boolean);
@@ -912,8 +1054,8 @@ class ProxmoxDashboardCard extends HTMLElement {
       ...allDisks.map((disk) => (Number.isFinite(disk.temperature) ? levelForValue(disk.temperature, this._config.thresholds.disk_temperature) : undefined)),
     ];
     const updateLevels = nodes.flatMap((node) => [
-      node.raw.updates_entity ? levelForValue(node.updates, this._config.thresholds.updates) : undefined,
-      node.raw.updates_packages_entity ? levelForStatus(this._stateValue(node.raw.updates_packages_entity)) : undefined,
+      node.raw.updates_entity ? levelForUpdates(node.updates) : undefined,
+      node.raw.updates_packages_entity ? levelForUpdateState(this._stateValue(node.raw.updates_packages_entity)) : undefined,
     ]);
     const indicators = [
       hasCluster
@@ -956,14 +1098,15 @@ class ProxmoxDashboardCard extends HTMLElement {
       hasStorage ? { key: "storage", label: "Storage", icon: "storage", level: worstLevel(allStorages.map((storage) => storage.level), "unknown"), sources: storageSources } : undefined,
       hasDisks ? { key: "disks", label: "Disks", icon: "disk", level: worstLevel(allDisks.map((disk) => disk.level), "unknown"), sources: diskSources } : undefined,
       hasTemperature ? { key: "temperature", label: "Temp", icon: "thermometer", level: worstLevel(temperatureLevels, "unknown"), sources: tempSources } : undefined,
-      hasUpdates ? { key: "updates", label: "Updates", icon: "updates", level: worstLevel(updateLevels, "unknown"), sources: updateSources } : undefined,
+      hasUpdates ? { key: "updates", label: "Updates", icon: "updates", level: updateIndicatorLevel(updateLevels), sources: updateSources } : undefined,
     ]
       .filter(Boolean)
       .map((indicator) => this._applyIndicatorState(indicator));
+    const healthIndicators = indicators.filter((indicator) => indicator.key !== "updates");
 
     return {
       nodes,
-      overall: worstLevel(indicators.map((indicator) => indicator.displayLevel), "unknown"),
+      overall: worstLevel(healthIndicators.map((indicator) => indicator.displayLevel), "unknown"),
       indicators,
       totals: {
         nodes: nodes.length,
@@ -1124,11 +1267,12 @@ class ProxmoxDashboardCard extends HTMLElement {
 
   _statisticsItems() {
     return [...this._statisticsTriggered.values()]
+      .filter((item) => item.source?.statistics !== false)
       .sort((a, b) => b.lastSeen - a.lastSeen)
       .slice(0, 8)
       .map((item) => ({
         ...item,
-        samples: this._statisticsSamples.get(item.source.key) || [],
+        samples: this._samplesForSource(item.source),
       }));
   }
 
@@ -1140,7 +1284,7 @@ class ProxmoxDashboardCard extends HTMLElement {
         <div class="statistics-header">
           <div>
             <h3>Statistics</h3>
-            <p>${items.length ? "Threshold-triggering parameters since this card was loaded." : "No statusbar warnings have been triggered since this card was loaded."}</p>
+            <p>${items.length ? "Threshold-triggering parameters over the last 24 hours." : "No statusbar warnings have been triggered."}</p>
           </div>
         </div>
         ${
@@ -1165,7 +1309,7 @@ class ProxmoxDashboardCard extends HTMLElement {
           </div>
           <b>${current}</b>
         </div>
-        ${source.numeric ? this._renderNumericStatisticChart(source, item.samples) : this._renderStatusStatisticChart(item)}
+        ${source.numeric ? this._renderNumericStatisticChart(source, item.samples) : this._renderStatusStatisticChart(item, item.samples)}
       </article>
     `;
   }
@@ -1176,8 +1320,8 @@ class ProxmoxDashboardCard extends HTMLElement {
     const height = 92;
     const padding = 12;
     const now = Date.now();
-    const start = chartSamples[0]?.time || now - 1;
-    const end = Math.max(now, chartSamples[chartSamples.length - 1]?.time || now);
+    const start = now - STATISTICS_WINDOW_MS;
+    const end = now;
     const maxValue = Math.max(source.critical || 0, source.warning || 0, ...chartSamples.map((sample) => sample.value), 1) * 1.12;
     const x = (time) => padding + ((time - start) / Math.max(1, end - start)) * (width - padding * 2);
     const y = (value) => height - padding - (clamp(value, 0, maxValue) / maxValue) * (height - padding * 2);
@@ -1211,13 +1355,37 @@ class ProxmoxDashboardCard extends HTMLElement {
     `;
   }
 
-  _renderStatusStatisticChart(item) {
+  _renderStatusStatisticChart(item, samples = []) {
+    const chartSamples = samples.filter((sample) => Number.isFinite(sample.time));
+    const width = 320;
+    const height = 74;
+    const padding = 8;
+    const now = Date.now();
+    const start = now - STATISTICS_WINDOW_MS;
+    const end = now;
+    const x = (time) => padding + ((time - start) / Math.max(1, end - start)) * (width - padding * 2);
+    const bands = chartSamples
+      .map((sample, index) => {
+        const level = sample.level || levelForStatus(sample.state);
+        if (!isAlarmLevel(level)) return "";
+        const next = chartSamples[index + 1];
+        const bandX = x(sample.time);
+        const bandEnd = x(next?.time || end);
+        const bandWidth = Math.max(2, bandEnd - bandX);
+        return `<rect class="stat-band stat-band-${level}" x="${bandX.toFixed(1)}" y="8" width="${bandWidth.toFixed(1)}" height="${height - 16}"></rect>`;
+      })
+      .join("");
+
     return `
       <div class="status-stat-chart status-stat-${item.level}">
+        <svg class="status-stat-timeline" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+          <rect class="stat-chart-bg" x="0" y="0" width="${width}" height="${height}"></rect>
+          ${bands}
+        </svg>
         <span>${html(item.source.state || labelForLevel(item.level))}</span>
       </div>
       <div class="stat-legend">
-        <span>State triggered the statusbar</span>
+        <span>Last 24 hours</span>
       </div>
     `;
   }
@@ -1394,6 +1562,7 @@ class ProxmoxDashboardCard extends HTMLElement {
     return `
       :host {
         --pdc-ok: #28c76f;
+        --pdc-info: #2d9cdb;
         --pdc-warn: #ffb020;
         --pdc-critical: #ff4d4f;
         --pdc-unknown: #8a94a6;
@@ -1525,6 +1694,11 @@ class ProxmoxDashboardCard extends HTMLElement {
       .gauge-ok,
       .micro-ok {
         color: var(--pdc-ok);
+      }
+
+      .overall-info,
+      .indicator-info {
+        color: var(--pdc-info);
       }
 
       .overall-warn,
@@ -1757,13 +1931,27 @@ class ProxmoxDashboardCard extends HTMLElement {
 
       .status-stat-chart {
         min-height: 74px;
+        position: relative;
         display: grid;
         place-items: center;
+        overflow: hidden;
         border-radius: 6px;
         color: var(--stat-color, var(--pdc-warn));
         background: color-mix(in srgb, currentColor 10%, transparent);
         font-size: 1rem;
         font-weight: 900;
+      }
+
+      .status-stat-timeline {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+      }
+
+      .status-stat-chart span {
+        position: relative;
+        z-index: 1;
       }
 
       .stat-legend {

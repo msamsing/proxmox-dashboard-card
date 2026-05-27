@@ -15,7 +15,8 @@ A Home Assistant Lovelace custom card for monitoring a Proxmox cluster at a glan
 - Collapsible details view, so the card can run as a compact status-bar-only cluster indicator.
 - Delayed load and memory alerts to avoid statusbar reactions to short spikes.
 - Click-to-acknowledge status indicators that stay amber/red until acknowledged.
-- Optional Statistics section showing the parameters that triggered statusbar warnings.
+- Updates are shown as a blue information signal and do not create amber/red alerts.
+- Optional Statistics section showing the last 24 hours for threshold-triggering parameters.
 - Visual Lovelace editor for selecting the entities used by each parameter.
 - HACS-ready repository layout with the installable card in `dist/proxmox-dashboard-card.js`.
 
@@ -71,9 +72,6 @@ thresholds:
   wearout:
     warning: 60
     critical: 85
-  updates:
-    warning: 1
-    critical: 30
 nodes:
   - name: Node A
     status_entity: sensor.node_a_status
@@ -173,11 +171,14 @@ If `used_percentage_entity` is not set for storage, the card can calculate usage
 The card combines the configured status entities and thresholds into one overall state:
 
 - Green: values are below warning thresholds and status entities are healthy.
-- Amber: values exceed warning thresholds long enough to pass the configured alert delay, updates are available, a guest is stopped, or a status reports a warning/degraded state.
+- Blue: updates are available. This is informational only and does not affect the overall health state or Statistics section.
+- Amber: values exceed warning thresholds long enough to pass the configured alert delay, a guest is stopped, or a status reports a warning/degraded state.
 - Red: values exceed critical thresholds, a disk reports failed/problem health, or an entity reports offline/failed/unavailable.
 - Gray: a category has not been configured or cannot be evaluated yet.
 
 Load and memory alerts are delayed by `alert_delay_seconds` before they affect the statusbar and the aggregate Cluster/Nodes indicators. Other health signals, such as disk problems and storage thresholds, react immediately. Once a statusbar icon turns amber or red, it stays latched until the icon is clicked. Clicking acknowledges the current condition and returns that icon to green unless the condition escalates or a new condition appears.
+
+The Statistics section focuses on threshold and health conditions that need troubleshooting. It excludes update availability and stopped VM/LXC status rows, and uses Home Assistant history to show the last 24 hours when available.
 
 ## Development
 
